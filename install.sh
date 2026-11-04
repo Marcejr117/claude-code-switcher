@@ -17,7 +17,8 @@ if ! python3 -c 'import tomllib' 2>/dev/null; then
 fi
 
 install -Dm 755 "$here/csw" "$bin_dir/csw"
-install -Dm 644 "$here/modules"/*.py "$data_dir/"
+install -d "$data_dir"
+install -m 644 "$here/modules"/*.py "$data_dir/"
 echo "installed: $bin_dir/csw (+ $(ls "$here/modules" | wc -l) modules in $data_dir)"
 
 if [ "$with_proxy" = 1 ]; then

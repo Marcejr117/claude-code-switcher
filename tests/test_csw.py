@@ -277,6 +277,23 @@ class ProfilesTest(unittest.TestCase):
         self.assertEqual(profile.stat().st_mode & 0o777, 0o600)
         self.assertEqual(csw.read_json(csw.LIVE)["env"]["ANTHROPIC_AUTH_TOKEN"], "test-deepseek-key")
 
+    def test_add_accounts_on_fresh_install_uses_builtin_templates(self):
+        for filename in set(csw.ALIASES.values()):
+            (csw.ROOT / filename).unlink(missing_ok=True)
+        for backend, url, model in (("glm", "https://api.z.ai/api/anthropic", "glm-5.3"),
+                                    ("deepseek", "https://api.deepseek.com/anthropic", "deepseek-v4-pro")):
+            with patch.object(csw.getpass, "getpass", return_value=f"fresh-{backend}-key"):
+                csw.add_account(backend, "fresh")
+            data = csw.read_json(csw.resolve(f"{backend}:fresh"))
+            self.assertEqual(data["env"]["ANTHROPIC_BASE_URL"], url)
+            self.assertEqual(data["env"]["ANTHROPIC_AUTH_TOKEN"], f"fresh-{backend}-key")
+            self.assertEqual(csw.effective_model(data), model)
+            self.assertEqual(csw.provider(data), "GLM" if backend == "glm" else "DeepSeek")
+        base = csw.account_seed("codex")
+        self.assertEqual(base["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:18765")
+        self.assertEqual(base["env"]["ANTHROPIC_AUTH_TOKEN"], "unused")
+        self.assertEqual(csw.provider(base), "Codex")
+
     def test_orcarouter_context_windows_tag_and_limits(self):
         with patch.object(csw.getpass, "getpass", return_value="orca-test-key"):
             csw.add_account("orcarouter", "principal")

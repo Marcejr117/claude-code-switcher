@@ -28,9 +28,29 @@ if not os.access(CLAUDE_BIN, os.X_OK):
     CLAUDE_BIN = shutil.which("claude") or "claude"
 LIVE, ACTIVE, NAMES = (ROOT / name for name in ("settings.json", ".settings-active", "settings.names"))
 DEEPSEEK_COMPAT_URL = "http://127.0.0.1:18768/deepseek"
+# Built-in account templates: what a fresh machine seeds new accounts from.
+# An existing primary profile (settings.json.GLM.bak etc.) takes precedence.
 ORCAROUTER_PROFILE = {"env": {"ANTHROPIC_BASE_URL": "https://api.orcarouter.ai", "ANTHROPIC_MODEL": "orcarouter/auto",
                               "CLAUDE_CODE_SUBAGENT_MODEL": "inherit", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"},
                       "model": "orcarouter/auto"}
+GLM_PROFILE = {"env": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic", "ANTHROPIC_MODEL": "glm-5.3",
+                       "CLAUDE_CODE_SUBAGENT_MODEL": "inherit", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"},
+               "model": "glm-5.3"}
+DEEPSEEK_PROFILE = {"env": {"ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic", "ANTHROPIC_MODEL": "deepseek-v4-pro",
+                            "CLAUDE_CODE_SUBAGENT_MODEL": "inherit", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"},
+                    "model": "deepseek-v4-pro"}
+CLAUDE_PROFILE = {"env": {"CLAUDE_CODE_SUBAGENT_MODEL": "inherit", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"},
+                  "model": "default"}
+CODEX_PROFILE = {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:18765", "ANTHROPIC_AUTH_TOKEN": "unused",
+                         "ANTHROPIC_MODEL": "gpt-5.6-sol",
+                         "CLAUDE_CODE_SUBAGENT_MODEL": "inherit", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"},
+                 "model": "gpt-5.6-sol"}
+CURSOR_PROFILE = {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:18765", "ANTHROPIC_AUTH_TOKEN": "unused",
+                          "ANTHROPIC_MODEL": "cursor:composer-2.5", "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": "1",
+                          "CLAUDE_CODE_SUBAGENT_MODEL": "inherit", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"},
+                  "model": "cursor:composer-2.5"}
+ACCOUNT_TEMPLATES = {"glm": GLM_PROFILE, "deepseek": DEEPSEEK_PROFILE, "orcarouter": ORCAROUTER_PROFILE,
+                     "claude": CLAUDE_PROFILE, "codex": CODEX_PROFILE, "cursor": CURSOR_PROFILE}
 ALIASES = {
     "glm": "settings.json.GLM.bak",
     "glm2": "settings.json.GLM2.bak",
@@ -280,6 +300,7 @@ def fetch_model_catalog(path, target):
             pass
         # La API omite context_length en parte de las respuestas: se conserva lo conocido.
         if windows:
+            windows_path.parent.mkdir(mode=0o700, exist_ok=True)
             write_json(windows_path, windows)
         source = "API OrcaRouter: catálogo anunciado; acceso sujeto al plan"
     elif backend == "Claude sub":
@@ -805,8 +826,12 @@ def switch(value):
 
 
 def show_list(archives=False):
+    entries = list(profiles(archives))
+    if not entries:
+        print("Sin perfiles todavía. Crea uno: csw add glm|deepseek|orcarouter|claude|codex|cursor <nombre>")
+        return
     labels = names()
-    for index, name in enumerate(profiles(archives), 1):
+    for index, name in enumerate(entries, 1):
         try:
             backend = provider(read_json(ROOT / name))
         except (ValueError, OSError):
@@ -948,6 +973,11 @@ def perform_login(value, device=None, browser=False):
     return result
 
 
+def account_seed(backend):
+    primary = ROOT / ALIASES.get(backend, "")
+    return read_json(primary) if primary.is_file() else copy.deepcopy(ACCOUNT_TEMPLATES[backend])
+
+
 def add_account(backend, slug, device=None, browser=False):
     if backend not in ("codex", "cursor", "claude", "glm", "deepseek", "orcarouter") or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", slug):
         raise ValueError("Usa csw add codex|cursor|claude|glm|deepseek|orcarouter nombre; nombre en minúsculas, números, guion o guion bajo")
@@ -962,7 +992,7 @@ def add_account(backend, slug, device=None, browser=False):
     if backend in ("claude", "glm", "deepseek", "orcarouter"):
         if profile.exists() or (backend == "claude" and (ROOT / "accounts" / "claude" / slug).exists()):
             raise ValueError(f"La cuenta ya existe: {backend}:{slug}")
-        target = merge_provider({}, ORCAROUTER_PROFILE if backend == "orcarouter" else read_json(resolve(backend)))
+        target = merge_provider({}, account_seed(backend))
         if backend != "claude":
             key = getpass.getpass(f"Clave API de {backend} ({slug}): ").strip()
             if not key:
@@ -980,7 +1010,7 @@ def add_account(backend, slug, device=None, browser=False):
     with locked():
         if directory.exists() or profile.exists():
             raise ValueError(f"La cuenta ya existe. Usa csw login {backend}:{slug}")
-        base = read_json(resolve(backend))
+        base = account_seed(backend)
         reserved = {read_json(p).get("port") for p in (CONFIG_ROOT / "accounts").glob("*/config.json")}
         for port in range(18766, 18866):
             if port in reserved:

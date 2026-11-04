@@ -55,11 +55,29 @@ That installs `csw` to `~/.local/bin` and its support modules to
 Optional pieces in `contrib/`:
 
 - `csw.sh` — a `claude()` shell wrapper that routes every launch through
-  `csw launch` (reads the shared live settings).
-- `statusline.sh` — minimal status line showing provider · profile · model · cwd.
+  `csw launch` (reads the shared live settings):
+
+  ```sh
+  echo 'source ~/.local/share/csw/csw.sh' >> ~/.zshrc   # or ~/.bashrc
+  install -Dm 644 contrib/csw.sh ~/.local/share/csw/csw.sh
+  ```
+
+- `statusline.sh` — minimal status line showing provider · profile · model ·
+  context window · cwd. Personal settings (this included) survive profile
+  switches:
+
+  ```sh
+  install -Dm 755 contrib/statusline.sh ~/.local/share/csw/statusline.sh
+  claude config set --global statusLine '{"type":"command","command":"bash ~/.local/share/csw/statusline.sh"}'
+  ```
+
 - `systemd/` — user units for the subscription proxy (see below).
 
 ## Quickstart
+
+Each provider needs one account. On a fresh install, accounts are seeded from
+built-in templates (base URL, sane default model, subagent inheritance); your
+API key is prompted hidden and stored only in `~/.claude` with mode `0600`.
 
 ```sh
 csw add glm main          # direct Z.ai API key, hidden prompt
