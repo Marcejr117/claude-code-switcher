@@ -1,0 +1,18 @@
+[Unit]
+Description=Claude Code proxy account %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/claude-code-proxy serve --no-monitor
+Environment=CCP_CONFIG_DIR=%h/.config/claude-code-proxy/accounts/%i
+Environment=XDG_STATE_HOME=%h/.local/state/claude-code-proxy-accounts/%i
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
