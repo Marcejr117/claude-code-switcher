@@ -338,8 +338,10 @@ class HotTest(unittest.TestCase):
     def test_private_state_and_no_secret_in_model_picker(self):
         settings = csw.read_json(self.directory / "settings.json")
         self.assertNotIn("test-deepseek-key", str(settings["modelPicker"]))
-        self.assertEqual((self.directory / "state.json").stat().st_mode & 0o777, 0o600)
-        self.assertEqual((self.directory / "settings.json").stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":  # POSIX modes only; Windows relies on the profile ACL
+            self.assertEqual((self.directory / "state.json").stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":  # POSIX modes only; Windows relies on the profile ACL
+            self.assertEqual((self.directory / "settings.json").stat().st_mode & 0o777, 0o600)
 
     def test_default_menu_opens_guided_home_in_a_terminal(self):
         ui = csw.ui_module()

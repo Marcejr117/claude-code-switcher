@@ -2,7 +2,7 @@
 """Switch Claude Code providers while preserving shared configuration."""
 import copy
 import contextlib
-import fcntl
+import functools
 import getpass
 import importlib.util
 import json
@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -18,6 +19,12 @@ import time
 import tomllib
 import types
 import urllib.request
+
+if os.name == "nt":
+    # Pipes and hook output default to the ANSI code page; csw prints arrows and accents.
+    for _stream in (sys.stdout, sys.stderr):
+        if _stream and (_stream.encoding or "").lower() != "utf-8":
+            _stream.reconfigure(encoding="utf-8")
 
 ROOT = Path(os.environ.get("CSW_CONFIG_DIR", Path.home() / ".claude"))
 CONFIG_ROOT = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "claude-code-proxy"
@@ -119,7 +126,7 @@ def codex_context_budget(model):
     """
     raw = re.sub(r"\[1m\]$", "", str(model)).removesuffix("-fast")
     try:
-        catalog = json.loads(CODEX_NATIVE_CATALOG.read_text())
+        catalog = json.loads(CODEX_NATIVE_CATALOG.read_text(encoding="utf-8"))
         record = next((item for item in catalog.get("models", []) if item.get("slug") == raw), None)
         if record is None:
             return None
@@ -127,7 +134,7 @@ def codex_context_budget(model):
         maximum = record.get("max_context_window", default)
         if not isinstance(default, int) or not isinstance(maximum, int) or min(default, maximum) <= 0:
             return None
-        config = tomllib.loads(CODEX_NATIVE_CONFIG.read_text()) if CODEX_NATIVE_CONFIG.exists() else {}
+        config = tomllib.loads(CODEX_NATIVE_CONFIG.read_text(encoding="utf-8")) if CODEX_NATIVE_CONFIG.exists() else {}
         requested = config.get("model_context_window", default)
         if not isinstance(requested, int) or requested <= 0:
             requested = default
@@ -167,7 +174,7 @@ def documented_context(model, target):
     elif backend == "OrcaRouter":
         # Ventanas reales publicadas por /v1/models; sin ellas Claude asume 200K.
         try:
-            windows = json.loads((ROOT / "model-catalogs" / "orca-windows.json").read_text())
+            windows = json.loads((ROOT / "model-catalogs" / "orca-windows.json").read_text(encoding="utf-8"))
             window = windows.get(raw)
             return window if isinstance(window, int) else None
         except (OSError, ValueError):
@@ -235,6 +242,23 @@ def context_label(model, target):
     return "1M" if window is not None and window >= 1000000 else f"{window // 1000}K" if window else "sin verificar"
 
 
+def codex_cli_models():
+    """What the Codex CLI /model picker lists for its signed-in account, in its order.
+
+    The proxy (>= 0.1.48) accepts every API-supported model of this same cache,
+    so these rows also work through it. Empty when Codex CLI never signed in.
+    """
+    try:
+        catalog = json.loads(CODEX_NATIVE_CATALOG.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    entries = [m for m in catalog.get("models", []) if isinstance(m, dict)
+               and m.get("visibility") == "list" and m.get("supported_in_api") is True
+               and re.fullmatch(r"gpt-[A-Za-z0-9_.-]+", str(m.get("slug", "")))]
+    entries.sort(key=lambda m: m.get("priority") if isinstance(m.get("priority"), int) else 999)
+    return [{"model": m["slug"], "label": str(m.get("display_name") or m["slug"])} for m in entries]
+
+
 def fetch_model_catalog(path, target):
     backend = provider(target)
     env = target.get("env", {})
@@ -260,15 +284,18 @@ def fetch_model_catalog(path, target):
                 rows.append({"model": "cursor:" + match[1], "label": match[2]})
         source = "Cursor CLI: catálogo de esta cuenta; compatibilidad del proxy no garantizada"
     elif backend == "Codex":
-        result = subprocess.run(["claude-code-proxy", "models"], capture_output=True, text=True, timeout=20)
-        if result.returncode:
-            raise ValueError("No se pudo consultar el catálogo del proxy")
-        line = next((x for x in result.stdout.splitlines() if x.startswith("codex: ")), "")
-        featured = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-daybreak-blue-latest", "gpt-5.5"]
-        models = [m for m in line.removeprefix("codex: ").split(", ") if m.startswith("gpt-")]
-        models.sort(key=lambda m: (featured.index(m) if m in featured else len(featured), m))
-        rows = [{"model": m, "label": "Daybreak Blue — ciberseguridad defensiva" if m == "gpt-daybreak-blue-latest" else m} for m in models]
-        source = "Catálogo del proxy; acceso sujeto a la cuenta Codex"
+        rows = codex_cli_models()
+        source = "Catálogo de Codex CLI (~/.codex): los modelos y el orden de su /model"
+        if not rows:
+            result = subprocess.run(["claude-code-proxy", "models"], capture_output=True, text=True, timeout=20)
+            if result.returncode:
+                raise ValueError("No se pudo consultar el catálogo del proxy")
+            line = next((x for x in result.stdout.splitlines() if x.startswith("codex: ")), "")
+            featured = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-daybreak-blue-latest", "gpt-5.5"]
+            models = [m for m in line.removeprefix("codex: ").split(", ") if m.startswith("gpt-")]
+            models.sort(key=lambda m: (featured.index(m) if m in featured else len(featured), m))
+            rows = [{"model": m, "label": "Daybreak Blue — ciberseguridad defensiva" if m == "gpt-daybreak-blue-latest" else m} for m in models]
+            source = "Catálogo del proxy; acceso sujeto a la cuenta Codex"
     elif backend in ("GLM", "DeepSeek"):
         endpoint = "https://api.z.ai/api/paas/v4/models" if backend == "GLM" else "https://api.deepseek.com/models"
         request = urllib.request.Request(endpoint, headers={"Authorization": "Bearer " + env.get("ANTHROPIC_AUTH_TOKEN", "")})
@@ -292,7 +319,7 @@ def fetch_model_catalog(path, target):
         windows = {row["model"]: row["context_length"] for row in rows if isinstance(row.get("context_length"), int)}
         windows_path = ROOT / "model-catalogs" / "orca-windows.json"
         try:
-            previous = json.loads(windows_path.read_text())
+            previous = json.loads(windows_path.read_text(encoding="utf-8"))
             if isinstance(previous, dict):
                 previous.update(windows)
                 windows = previous
@@ -448,7 +475,7 @@ def provider_key(key):
 
 
 def read_json(path):
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or not isinstance(data.get("env", {}), dict):
         raise ValueError(f"Configuración inválida: {path.name}")
     if any(not isinstance(value, (str, int, float, bool)) for value in data.get("env", {}).values()):
@@ -461,11 +488,19 @@ def atomic_write(path, text):
         raise ValueError(f"No se sustituye un enlace simbólico: {path}")
     fd, temporary = tempfile.mkstemp(prefix=".csw-", dir=path.parent)
     try:
-        with os.fdopen(fd, "w") as stream:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        for attempt in range(50):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                # Windows refuses to replace a file another process (Claude) has open for a moment.
+                if os.name != "nt" or attempt == 49:
+                    raise
+                time.sleep(0.05)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -476,11 +511,11 @@ def write_json(path, data):
 
 
 def active():
-    return ACTIVE.read_text().strip() if ACTIVE.exists() else ""
+    return ACTIVE.read_text(encoding="utf-8").strip() if ACTIVE.exists() else ""
 
 
 def names():
-    return dict(line.split("\t", 1) for line in NAMES.read_text().splitlines()
+    return dict(line.split("\t", 1) for line in NAMES.read_text(encoding="utf-8").splitlines()
                 if "\t" in line) if NAMES.exists() else {}
 
 
@@ -598,7 +633,7 @@ def check_proxy(target):
     target = provider_transport(target)
     if target.get("env", {}).get("ANTHROPIC_BASE_URL") == DEEPSEEK_COMPAT_URL:
         if not proxy_ready(DEEPSEEK_COMPAT_URL):
-            subprocess.run(["systemctl", "--user", "start", "csw-deepseek-compat.service"], check=True)
+            systemctl("start", "csw-deepseek-compat.service", check=True)
             for _ in range(20):
                 if proxy_ready(DEEPSEEK_COMPAT_URL):
                     break
@@ -615,7 +650,7 @@ def check_proxy(target):
         account = backend if directory == CONFIG_ROOT else f"{backend}:{directory.name.split('-', 1)[1]}"
         raise ValueError(f"Falta iniciar sesión: csw login {account}. Perfil actual conservado.")
     if not proxy_ready(url):
-        subprocess.run(["systemctl", "--user", "start", unit], check=True)
+        systemctl("start", unit, check=True)
         for _ in range(20):
             if proxy_ready(url):
                 break
@@ -624,9 +659,18 @@ def check_proxy(target):
             raise ValueError("El proxy no responde. Consulta csw doctor; perfil actual conservado.")
 
 
+@functools.cache
+def portable_module():
+    return support_module("portable")
+
+
+def systemctl(*args, check=False, capture_output=False):
+    return portable_module().systemctl(list(args), ROOT, CONFIG_ROOT, check=check, capture_output=capture_output)
+
+
 def locked():
     stream = (ROOT / ".csw.lock").open("a")
-    fcntl.flock(stream, fcntl.LOCK_EX)
+    portable_module().flock(stream)
     return stream
 
 
@@ -636,7 +680,7 @@ def account_lock(path, exclusive=False):
     directory.mkdir(mode=0o700, exist_ok=True)
     with (directory / (path.name + ".lock")).open("a") as stream:
         try:
-            fcntl.flock(stream, (fcntl.LOCK_EX | fcntl.LOCK_NB) if exclusive else fcntl.LOCK_SH)
+            portable_module().flock(stream, exclusive=exclusive, blocking=not exclusive)
         except BlockingIOError:
             raise ValueError("Esta cuenta tiene una sesión o login abierto; ciérralo antes de retirarla") from None
         yield
@@ -656,6 +700,10 @@ def legacy_session_running(path, target):
     directory, _ = account_directory(path)
     url = target.get("env", {}).get("ANTHROPIC_BASE_URL", "")
     key = target.get("env", {}).get("ANTHROPIC_AUTH_TOKEN", "")
+    if os.name == "nt":
+        # ponytail: Windows cannot read another process's environment; account_lock
+        # still catches every session opened with csw run, only bare launches are missed.
+        return False
     for process in Path("/proc").glob("[0-9]*"):
         try:
             if process.stat().st_uid != os.getuid():
@@ -702,8 +750,8 @@ def remove_account(value):
         archive = Path(tempfile.mkdtemp(prefix=identifier.replace(":", "-") + "-", dir=archive_root))
         enabled = running = False
         if unit:
-            enabled = subprocess.run(["systemctl", "--user", "is-enabled", unit], capture_output=True).returncode == 0
-            running = subprocess.run(["systemctl", "--user", "is-active", unit], capture_output=True).returncode == 0
+            enabled = systemctl("is-enabled", unit, capture_output=True).returncode == 0
+            running = systemctl("is-active", unit, capture_output=True).returncode == 0
         metadata = {"profile": path.name, "label": labels.get(path.name, profile_label(path)),
                     "has_directory": bool(directory and directory.exists()), "enabled": enabled, "running": running,
                     "has_catalog": model_cache(path).is_file()}
@@ -711,7 +759,7 @@ def remove_account(value):
         moved = []
         try:
             if unit:
-                subprocess.run(["systemctl", "--user", "disable", "--now", unit], check=True, capture_output=True)
+                systemctl("disable", "--now", unit, check=True, capture_output=True)
             path.rename(archive / "profile.json")
             moved.append((archive / "profile.json", path))
             if metadata["has_directory"]:
@@ -726,9 +774,9 @@ def remove_account(value):
             for archived, original in reversed(moved):
                 archived.rename(original)
             if unit and enabled:
-                subprocess.run(["systemctl", "--user", "enable", unit], capture_output=True)
+                systemctl("enable", unit, capture_output=True)
             if unit and running:
-                subprocess.run(["systemctl", "--user", "start", unit], capture_output=True)
+                systemctl("start", unit, capture_output=True)
             raise
     print(f"Retirado: {identifier}. Copia privada recuperable: {archive}")
     print(f"Restaurar: csw restore {archive.name}")
@@ -771,7 +819,7 @@ def restore_account(identifier):
             path.rename(archive / "profile.json")
             raise
     if unit and metadata.get("enabled"):
-        subprocess.run(["systemctl", "--user", "enable", unit], check=True, capture_output=True)
+        systemctl("enable", unit, check=True, capture_output=True)
     print(f"Restaurado: {profile_label(path)}. Selección actual conservada; para abrir: csw run {profile_label(path)}")
 
 
@@ -927,7 +975,18 @@ def ensure_native_links(directory):
         source = ROOT / name
         destination = directory / name
         if source.exists() and not destination.exists() and not destination.is_symlink():
-            destination.symlink_to(source, target_is_directory=source.is_dir())
+            try:
+                destination.symlink_to(source, target_is_directory=source.is_dir())
+            except OSError:
+                if os.name != "nt":
+                    raise
+                # Windows without Developer Mode: junctions and hard links need no privilege.
+                # ponytail: a hard-linked file detaches if an editor replaces it instead of writing in place.
+                if source.is_dir():
+                    import _winapi
+                    _winapi.CreateJunction(str(source), str(destination))
+                else:
+                    os.link(source, destination)
 
 
 def prepare_native_account(slug, target):
@@ -968,7 +1027,7 @@ def perform_login(value, device=None, browser=False):
     auth_command = "device" if backend == "codex" and not browser else "login"
     result = subprocess.call(["claude-code-proxy", backend, "auth", auth_command], env=environment)
     if result == 0:
-        subprocess.run(["systemctl", "--user", "enable", "--now", unit], check=True)
+        systemctl("enable", "--now", unit, check=True)
         print(f"Cuenta lista. Para seleccionarla: csw {value}")
     return result
 
@@ -1062,7 +1121,14 @@ def launch_claude(args):
         forwarded = [*forwarded, "--model", model]
         environment["CSW_INITIAL_MODEL"] = model
     # No --settings snapshot or provider credentials. Claude watches ROOT itself.
-    return os.execvpe(CLAUDE_BIN, [CLAUDE_BIN, *forwarded], environment)
+    return exec_claude(CLAUDE_BIN, [CLAUDE_BIN, *forwarded], environment)
+
+
+def exec_claude(file, argv, environment):
+    if os.name == "nt":
+        # exec on Windows spawns and exits, handing the console back mid-session.
+        return run_child(argv, env=environment)
+    return os.execvpe(file, argv, environment)
 
 
 def run_claude(args):
@@ -1121,9 +1187,82 @@ def run_claude(args):
             write_json(snapshot, overlay)
             # User scope owns MCP servers, skills and agents. Keep it enabled and
             # override only the provider, so hooks and permission lists load once.
-            return subprocess.call([CLAUDE_BIN, "--setting-sources", "user,project,local", "--settings", str(snapshot), *forwarded], env=environment)
+            guard, moved = shared_model_guard(profile, target)
+            result = run_child([CLAUDE_BIN, "--setting-sources", "user,project,local", "--settings", str(snapshot), *forwarded],
+                               env=environment, tick=guard)
+            if moved:
+                print(f"csw: el modelo predeterminado {moved[-1]} se guardó en {profile_label(profile)}, "
+                      "no en la configuración compartida.", file=sys.stderr)
+            return result
         finally:
             snapshot.unlink(missing_ok=True)
+
+
+def run_child(command, env, tick=None):
+    """Wait for Claude like exec would: Ctrl-C belongs to Claude (cancel a turn).
+
+    subprocess.call would kill Claude when Ctrl-C reached this launcher too.
+    tick runs about once a second while Claude is open.
+    """
+    child = subprocess.Popen(command, env=env)
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        while True:
+            try:
+                return child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                if tick:
+                    tick()
+    finally:
+        signal.signal(signal.SIGINT, previous)
+        if tick:
+            tick()
+
+
+def shared_model_guard(profile, target):
+    """Keep "/model … set as default" of an isolated csw run out of settings.json.
+
+    Claude saves that default to the user settings.json, which csw run shares
+    with every native session; a model of the run's provider there breaks them
+    (e.g. gpt-* sent to Anthropic). It is put back and kept in the run profile.
+    """
+    state = {"valid": read_json(LIVE).get("model")}
+    moved = []
+
+    def belongs(model, data):
+        try:
+            normalize_model(model, data)
+            return True
+        except ValueError:
+            return False
+
+    def guard():
+        try:
+            check()
+        except (OSError, ValueError):
+            pass  # settings.json mid-write or briefly locked: retry on the next tick
+
+    def check():
+        with locked():
+            live = read_json(LIVE)
+            chosen = live.get("model")
+            if (chosen == state["valid"] or not isinstance(chosen, str) or belongs(chosen, live)
+                    or not belongs(chosen, target)):
+                state["valid"] = chosen  # unchanged, or a native session's own choice
+                return
+            if state["valid"] is None:
+                live.pop("model", None)
+            else:
+                live["model"] = state["valid"]
+            write_json(LIVE, live)
+            if profile != LIVE and profile.is_file():
+                data = read_json(profile)
+                data["model"] = chosen
+                if data.get("env", {}).get("ANTHROPIC_MODEL"):
+                    data["env"]["ANTHROPIC_MODEL"] = chosen
+                write_json(profile, data)
+            moved.append(chosen)
+    return guard, moved
 
 
 def extract_extra_settings(args):
