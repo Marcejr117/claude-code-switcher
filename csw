@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1126,7 +1127,7 @@ def launch_claude(args):
 def exec_claude(file, argv, environment):
     if os.name == "nt":
         # exec on Windows spawns and exits, handing the console back mid-session.
-        return subprocess.call(argv, env=environment)
+        return run_child(argv, env=environment)
     return os.execvpe(file, argv, environment)
 
 
@@ -1186,9 +1187,82 @@ def run_claude(args):
             write_json(snapshot, overlay)
             # User scope owns MCP servers, skills and agents. Keep it enabled and
             # override only the provider, so hooks and permission lists load once.
-            return subprocess.call([CLAUDE_BIN, "--setting-sources", "user,project,local", "--settings", str(snapshot), *forwarded], env=environment)
+            guard, moved = shared_model_guard(profile, target)
+            result = run_child([CLAUDE_BIN, "--setting-sources", "user,project,local", "--settings", str(snapshot), *forwarded],
+                               env=environment, tick=guard)
+            if moved:
+                print(f"csw: el modelo predeterminado {moved[-1]} se guardó en {profile_label(profile)}, "
+                      "no en la configuración compartida.", file=sys.stderr)
+            return result
         finally:
             snapshot.unlink(missing_ok=True)
+
+
+def run_child(command, env, tick=None):
+    """Wait for Claude like exec would: Ctrl-C belongs to Claude (cancel a turn).
+
+    subprocess.call would kill Claude when Ctrl-C reached this launcher too.
+    tick runs about once a second while Claude is open.
+    """
+    child = subprocess.Popen(command, env=env)
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        while True:
+            try:
+                return child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                if tick:
+                    tick()
+    finally:
+        signal.signal(signal.SIGINT, previous)
+        if tick:
+            tick()
+
+
+def shared_model_guard(profile, target):
+    """Keep "/model … set as default" of an isolated csw run out of settings.json.
+
+    Claude saves that default to the user settings.json, which csw run shares
+    with every native session; a model of the run's provider there breaks them
+    (e.g. gpt-* sent to Anthropic). It is put back and kept in the run profile.
+    """
+    state = {"valid": read_json(LIVE).get("model")}
+    moved = []
+
+    def belongs(model, data):
+        try:
+            normalize_model(model, data)
+            return True
+        except ValueError:
+            return False
+
+    def guard():
+        try:
+            check()
+        except (OSError, ValueError):
+            pass  # settings.json mid-write or briefly locked: retry on the next tick
+
+    def check():
+        with locked():
+            live = read_json(LIVE)
+            chosen = live.get("model")
+            if (chosen == state["valid"] or not isinstance(chosen, str) or belongs(chosen, live)
+                    or not belongs(chosen, target)):
+                state["valid"] = chosen  # unchanged, or a native session's own choice
+                return
+            if state["valid"] is None:
+                live.pop("model", None)
+            else:
+                live["model"] = state["valid"]
+            write_json(LIVE, live)
+            if profile != LIVE and profile.is_file():
+                data = read_json(profile)
+                data["model"] = chosen
+                if data.get("env", {}).get("ANTHROPIC_MODEL"):
+                    data["env"]["ANTHROPIC_MODEL"] = chosen
+                write_json(profile, data)
+            moved.append(chosen)
+    return guard, moved
 
 
 def extract_extra_settings(args):

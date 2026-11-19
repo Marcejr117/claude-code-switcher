@@ -340,7 +340,7 @@ class ProfilesTest(unittest.TestCase):
         with patch.object(csw, "login", return_value=0):
             csw.add_account("claude", "max2")
         seen = {}
-        def launch(command, env):
+        def launch(command, env, tick=None):
             self.assertEqual(command[0], csw.CLAUDE_BIN)
             self.assertTrue(Path(env["CLAUDE_CONFIG_DIR"]).as_posix().endswith("accounts/claude/max2"))
             self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
@@ -352,7 +352,7 @@ class ProfilesTest(unittest.TestCase):
             self.assertNotIn("hooks", data)
             self.assertEqual(command[command.index("--setting-sources") + 1], "user,project,local")
             return 0
-        with patch.object(csw.subprocess, "call", side_effect=launch):
+        with patch.object(csw, "run_child", side_effect=launch):
             self.assertEqual(csw.run_claude(["claude:max2", "--", "-p", "test"]), 0)
         self.assertEqual(before, csw.LIVE.read_bytes())
         self.assertFalse(seen["snapshot"].exists())
@@ -362,10 +362,41 @@ class ProfilesTest(unittest.TestCase):
             csw.add_account("claude", "max2")
         csw.write_json(csw.ROOT / "accounts/claude/max2/.credentials.json", csw.read_json(csw.ROOT / ".credentials.json"))
         csw.switch("claude:max2")
-        with patch.object(csw.subprocess, "call", return_value=0) as call:
+        with patch.object(csw, "run_child", return_value=0) as call:
             csw.run_claude(["--", "hello world"])
         self.assertEqual(call.call_args.args[0][-1], "hello world")
         self.assertTrue(Path(call.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"]).as_posix().endswith("accounts/claude/max2"))
+
+    def test_run_default_model_choice_stays_out_of_shared_settings(self):
+        csw.switch("claude")
+        before = csw.read_json(csw.LIVE).get("model")
+        profile = csw.resolve("codex")
+
+        def set_live_model(model):
+            live = csw.read_json(csw.LIVE)
+            live["model"] = model
+            csw.write_json(csw.LIVE, live)
+
+        def launch(command, env, tick=None):
+            set_live_model("gpt-6.2-astra")  # Claude saving "/model … set as default"
+            tick()
+            self.assertEqual(csw.read_json(csw.LIVE).get("model"), before)
+            set_live_model("sonnet")  # another native session's own default stays
+            tick()
+            self.assertEqual(csw.read_json(csw.LIVE)["model"], "sonnet")
+            return 0
+
+        with patch.object(csw, "check_proxy"), patch.object(csw, "configure_model_picker"), \
+                patch.object(csw, "run_child", side_effect=launch):
+            self.assertEqual(csw.run_claude(["codex", "--", "-p", "test"]), 0)
+        self.assertEqual(csw.read_json(profile)["model"], "gpt-6.2-astra")
+
+    def test_run_child_waits_for_claude_and_ticks(self):
+        ticks = []
+        code = csw.run_child([sys.executable, "-c", "import time; time.sleep(1.5); raise SystemExit(3)"],
+                             env=os.environ.copy(), tick=lambda: ticks.append(1))
+        self.assertEqual(code, 3)
+        self.assertGreaterEqual(len(ticks), 2)  # while running and once at exit
 
     def test_run_auth_login_ignores_selected_api_credentials(self):
         with patch.object(csw.subprocess, "call", return_value=0) as call:
@@ -606,19 +637,19 @@ class ProfilesTest(unittest.TestCase):
         self.assertEqual(local_rules.read_text(), "keep local rule")
 
     def test_mcp_administration_loads_user_scope_without_needing_provider_login(self):
-        with patch.object(csw, "check_proxy", side_effect=AssertionError("unnecessary provider login")), patch.object(csw, "configure_model_picker", side_effect=AssertionError("unnecessary catalog fetch")), patch.object(csw.subprocess, "call", return_value=0) as call:
+        with patch.object(csw, "check_proxy", side_effect=AssertionError("unnecessary provider login")), patch.object(csw, "configure_model_picker", side_effect=AssertionError("unnecessary catalog fetch")), patch.object(csw, "run_child", return_value=0) as call:
             self.assertEqual(csw.run_claude(["codex", "--", "mcp", "list"]), 0)
         self.assertEqual(call.call_args.args[0][1:3], ["--setting-sources", "user,project,local"])
         self.assertEqual(call.call_args.args[0][-2:], ["mcp", "list"])
 
     def test_extra_settings_do_not_discard_provider_isolation(self):
         seen = {}
-        def launch(command, env):
+        def launch(command, env, tick=None):
             self.assertEqual(command.count("--settings"), 1)
             data = csw.read_json(Path(command[command.index("--settings") + 1]))
             seen.update(data)
             return 0
-        with patch.object(csw.subprocess, "call", side_effect=launch):
+        with patch.object(csw, "run_child", side_effect=launch):
             csw.run_claude(["claude", "--", "--settings", '{"disableAllHooks":true,"env":{"EXTRA_TEST":"yes"}}', '-p', 'test'])
         self.assertTrue(seen["disableAllHooks"])
         self.assertEqual(seen["env"]["ANTHROPIC_AUTH_TOKEN"], "")
@@ -720,7 +751,7 @@ class ProfilesTest(unittest.TestCase):
         profile = csw.ROOT / csw.ALIASES["codex"]
         profile_before = profile.read_bytes()
 
-        def launch(command, env):
+        def launch(command, env, tick=None):
             data = csw.read_json(Path(command[command.index("--settings") + 1]))
             for values in (env, data["env"]):
                 self.assertEqual(values["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "272000")
@@ -728,7 +759,7 @@ class ProfilesTest(unittest.TestCase):
             return 0
 
         for arguments in (["--model", "gpt-5.5"], ["--model=gpt-5.5"]):
-            with self.subTest(arguments=arguments), patch.object(csw, "check_proxy"), patch.object(csw, "configure_model_picker"), patch.object(csw.subprocess, "call", side_effect=launch):
+            with self.subTest(arguments=arguments), patch.object(csw, "check_proxy"), patch.object(csw, "configure_model_picker"), patch.object(csw, "run_child", side_effect=launch):
                 self.assertEqual(csw.run_claude(["codex", "--", *arguments, "-p", "test"]), 0)
         self.assertEqual(csw.LIVE.read_bytes(), before)
         self.assertEqual(profile.read_bytes(), profile_before)
