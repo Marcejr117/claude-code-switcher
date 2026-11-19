@@ -25,7 +25,9 @@ Cambio preparado... abre /model en la MISMA sesión. No reinicies.
   the live session — a model or account change applies to the running Claude
   Code instance on the next request, no restart needed.
 - **Model catalogs**: `csw models <profile>` lists what the provider actually
-  offers (queried from each provider's API, cached for an hour). Selecting a
+  offers (queried from each provider's API, cached for an hour). Codex
+  profiles mirror the Codex CLI `/model` list of the signed-in account
+  (`~/.codex/models_cache.json`), falling back to the proxy's list. Selecting a
   model via `csw model` or the `/model` picker keeps profiles in sync.
 - **Context windows**: known 1M-token models are tagged `[1m]`; smaller
   documented windows are enforced via `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, with
@@ -67,9 +69,13 @@ Same layout as Linux (`%USERPROFILE%\.local\bin\csw` plus a `csw.cmd` launcher,
 modules in `%USERPROFILE%\.local\share\csw`); the installer adds `.local\bin` to
 the user `PATH`. Differences from Linux:
 
-- Background services (DeepSeek adapter, Codex/Cursor proxy) are started on
-  demand as detached processes instead of systemd units; pid and log files live
-  in `~/.claude/services`. `install.ps1 -WithProxy` builds `claude-code-proxy.exe`.
+- Background services (DeepSeek adapter, Codex/Cursor proxy) run as detached
+  processes instead of systemd units; pid and log files live in
+  `~/.claude/services`. `enable` adds a per-user logon entry
+  (`HKCU\...\Run`, started through `pythonw`, no admin, no console window).
+- `install.ps1 -WithProxy` builds `claude-code-proxy.exe` from source. Use
+  0.1.48 or newer (needs a recent stable Rust, e.g. `rustup update stable`):
+  older builds only accept a fixed model list and reject newer Codex models.
 - File modes (`0600`) do not apply; profiles rely on the user profile ACL.
 - `csw rm` cannot see the environment of Claude sessions started without csw,
   so close those yourself before removing an account (sessions opened with

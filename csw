@@ -241,6 +241,23 @@ def context_label(model, target):
     return "1M" if window is not None and window >= 1000000 else f"{window // 1000}K" if window else "sin verificar"
 
 
+def codex_cli_models():
+    """What the Codex CLI /model picker lists for its signed-in account, in its order.
+
+    The proxy (>= 0.1.48) accepts every API-supported model of this same cache,
+    so these rows also work through it. Empty when Codex CLI never signed in.
+    """
+    try:
+        catalog = json.loads(CODEX_NATIVE_CATALOG.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    entries = [m for m in catalog.get("models", []) if isinstance(m, dict)
+               and m.get("visibility") == "list" and m.get("supported_in_api") is True
+               and re.fullmatch(r"gpt-[A-Za-z0-9_.-]+", str(m.get("slug", "")))]
+    entries.sort(key=lambda m: m.get("priority") if isinstance(m.get("priority"), int) else 999)
+    return [{"model": m["slug"], "label": str(m.get("display_name") or m["slug"])} for m in entries]
+
+
 def fetch_model_catalog(path, target):
     backend = provider(target)
     env = target.get("env", {})
@@ -266,15 +283,18 @@ def fetch_model_catalog(path, target):
                 rows.append({"model": "cursor:" + match[1], "label": match[2]})
         source = "Cursor CLI: catálogo de esta cuenta; compatibilidad del proxy no garantizada"
     elif backend == "Codex":
-        result = subprocess.run(["claude-code-proxy", "models"], capture_output=True, text=True, timeout=20)
-        if result.returncode:
-            raise ValueError("No se pudo consultar el catálogo del proxy")
-        line = next((x for x in result.stdout.splitlines() if x.startswith("codex: ")), "")
-        featured = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-daybreak-blue-latest", "gpt-5.5"]
-        models = [m for m in line.removeprefix("codex: ").split(", ") if m.startswith("gpt-")]
-        models.sort(key=lambda m: (featured.index(m) if m in featured else len(featured), m))
-        rows = [{"model": m, "label": "Daybreak Blue — ciberseguridad defensiva" if m == "gpt-daybreak-blue-latest" else m} for m in models]
-        source = "Catálogo del proxy; acceso sujeto a la cuenta Codex"
+        rows = codex_cli_models()
+        source = "Catálogo de Codex CLI (~/.codex): los modelos y el orden de su /model"
+        if not rows:
+            result = subprocess.run(["claude-code-proxy", "models"], capture_output=True, text=True, timeout=20)
+            if result.returncode:
+                raise ValueError("No se pudo consultar el catálogo del proxy")
+            line = next((x for x in result.stdout.splitlines() if x.startswith("codex: ")), "")
+            featured = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-daybreak-blue-latest", "gpt-5.5"]
+            models = [m for m in line.removeprefix("codex: ").split(", ") if m.startswith("gpt-")]
+            models.sort(key=lambda m: (featured.index(m) if m in featured else len(featured), m))
+            rows = [{"model": m, "label": "Daybreak Blue — ciberseguridad defensiva" if m == "gpt-daybreak-blue-latest" else m} for m in models]
+            source = "Catálogo del proxy; acceso sujeto a la cuenta Codex"
     elif backend in ("GLM", "DeepSeek"):
         endpoint = "https://api.z.ai/api/paas/v4/models" if backend == "GLM" else "https://api.deepseek.com/models"
         request = urllib.request.Request(endpoint, headers={"Authorization": "Bearer " + env.get("ANTHROPIC_AUTH_TOKEN", "")})

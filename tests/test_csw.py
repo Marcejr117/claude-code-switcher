@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -417,6 +418,21 @@ class ProfilesTest(unittest.TestCase):
         self.assertTrue(target["modelPicker"]["replaceBuiltInOptions"])
         self.assertEqual(target["modelPicker"]["options"][0], {"model": "gpt-6-astra", "label": "Codex · Astra", "description": "gpt-6-astra · contexto 272K"})
 
+    def test_codex_picker_mirrors_codex_cli_catalog_without_the_proxy(self):
+        csw.write_json(csw.CODEX_NATIVE_CATALOG, {"models": [
+            {"slug": "gpt-daybreak-blue-latest", "display_name": "Daybreak Blue", "visibility": "list", "supported_in_api": True, "priority": 12},
+            {"slug": "gpt-6.2-sol", "display_name": "GPT-6.2-Sol", "visibility": "list", "supported_in_api": True, "priority": 1},
+            {"slug": "gpt-reserve", "display_name": "GPT-Reserve", "visibility": "hide", "supported_in_api": True, "priority": 4},
+            {"slug": "gpt-no-api", "visibility": "list", "supported_in_api": False, "priority": 2},
+            {"slug": "codex-auto-review", "visibility": "list", "supported_in_api": True, "priority": 3},
+            {"slug": "gpt-6.1-terra", "display_name": "GPT-6.1 Terra", "visibility": "list", "supported_in_api": True, "priority": 3},
+        ]})
+        with patch.object(csw.subprocess, "run", side_effect=AssertionError("proxy not needed")):
+            catalog = csw.fetch_model_catalog(csw.resolve("codex"), self.proxy)
+        self.assertEqual([(r["model"], r["label"]) for r in catalog["models"]],
+                         [("gpt-6.2-sol", "GPT-6.2-Sol"), ("gpt-6.1-terra", "GPT-6.1 Terra"),
+                          ("gpt-daybreak-blue-latest", "Daybreak Blue")])
+
     def test_catalog_cache_is_per_account_and_refreshes_explicitly(self):
         path = csw.resolve("codex")
         csw.model_cache(path).unlink()
@@ -720,6 +736,48 @@ class ProfilesTest(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "Windows service emulation")
 class WindowsServiceTest(unittest.TestCase):
+    def setUp(self):
+        # Never touch the real logon Run key from tests.
+        import winreg
+        portable = csw.portable_module()
+        p = patch.object(portable, "RUN_KEY", r"Software\csw-test-run")
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(lambda: winreg.DeleteKey(winreg.HKEY_CURRENT_USER, r"Software\csw-test-run")
+                        if self._key_exists() else None)
+
+    @staticmethod
+    def _key_exists():
+        import winreg
+        try:
+            winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\csw-test-run").Close()
+            return True
+        except FileNotFoundError:
+            return False
+
+    def test_enable_registers_a_windowless_logon_start_and_disable_removes_it(self):
+        import shlex, winreg
+        portable = csw.portable_module()
+        with tempfile.TemporaryDirectory(prefix="csw-svc-") as folder:
+            unit, root = "csw-deepseek-compat.service", Path(folder)
+            run = lambda *a, **k: portable.systemctl(list(a), root, root / "proxy", **k)
+            self.assertEqual(run("is-enabled", unit).returncode, 1)
+            run("enable", unit, check=True)
+            self.addCleanup(run, "disable", "--now", unit)
+            self.assertEqual(run("is-enabled", unit).returncode, 0)
+            self.assertEqual(run("is-active", unit).returncode, 3)  # enable alone does not start
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\csw-test-run") as key:
+                command, _ = winreg.QueryValueEx(key, "csw " + unit)
+            argv = shlex.split(command, posix=False)
+            self.assertTrue(argv[0].strip('"').lower().endswith("pythonw.exe"), argv[0])
+            # What Windows runs at logon starts the unit.
+            subprocess_args = [sys.executable] + [a.strip('"') for a in argv[1:]]
+            self.assertEqual(csw.subprocess.run(subprocess_args, timeout=30).returncode, 0)
+            self.assertEqual(run("is-active", unit).returncode, 0)
+            run("disable", "--now", unit, check=True)
+            self.assertEqual(run("is-enabled", unit).returncode, 1)
+            self.assertEqual(run("is-active", unit).returncode, 3)
+
     def test_start_status_stop_tracks_a_real_detached_process(self):
         portable = csw.portable_module()
         with tempfile.TemporaryDirectory(prefix="csw-svc-") as folder:

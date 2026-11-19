@@ -124,8 +124,39 @@ else:
 
 # --- background services -----------------------------------------------------
 # Linux: systemd --user units. Windows: one detached process per unit, its pid
-# in ~/.claude/services/<unit>.pid. "enable" has no boot-time meaning there:
-# csw starts the service on demand whenever a profile needs it.
+# in ~/.claude/services/<unit>.pid; "enable" adds a per-user Run entry (no admin)
+# that starts the unit at logon through pythonw, so no console window appears.
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def _run_value(unit):
+    return "csw " + unit
+
+
+def _set_autostart(unit, state_root, config_root, enabled):
+    import winreg
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            windowless = Path(sys.executable).with_name("pythonw.exe")
+            python = windowless if windowless.is_file() else Path(sys.executable)
+            command = subprocess.list2cmdline([str(python), str(Path(__file__).resolve()), "start", unit,
+                                               str(state_root), str(config_root)])
+            winreg.SetValueEx(key, _run_value(unit), 0, winreg.REG_SZ, command)
+        else:
+            try:
+                winreg.DeleteValue(key, _run_value(unit))
+            except FileNotFoundError:
+                pass
+
+
+def _autostart_enabled(unit):
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            winreg.QueryValueEx(key, _run_value(unit))
+        return True
+    except FileNotFoundError:
+        return False
 
 def _service_command(unit, config_root):
     home = Path.home()
@@ -162,8 +193,11 @@ def systemctl(args, state_root, config_root, check=False, capture_output=False):
     now = "--now" in args
     unit = [a for a in args[1:] if a != "--now"][-1]
     code = 0
+    if action in ("enable", "disable"):
+        _service_command(unit, config_root)  # unknown units fail before touching the registry
+        _set_autostart(unit, state_root, config_root, action == "enable")
     if action == "is-enabled":
-        code = 1
+        code = 0 if _autostart_enabled(unit) else 1
     elif action == "is-active":
         code = 0 if _service_alive(state_root, unit) else 3
     elif action in ("start", "restart") or (action == "enable" and now):
@@ -195,7 +229,11 @@ def systemctl(args, state_root, config_root, check=False, capture_output=False):
     return result
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and sys.argv[1:2] == ["start"]:
+    # Logon entry written by "enable": portable.py start <unit> <state_root> <config_root>
+    _, _, unit, state_root, config_root = sys.argv
+    systemctl(["start", unit], Path(state_root), Path(config_root))
+elif __name__ == "__main__":
     # Self-check: locks exclude each other, our own process is visible.
     import tempfile
     with tempfile.TemporaryDirectory() as folder:
