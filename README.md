@@ -52,6 +52,34 @@ cd claude-code-switcher
 That installs `csw` to `~/.local/bin` and its support modules to
 `~/.local/share/csw` (make sure `~/.local/bin` is on your `PATH`).
 
+### Windows
+
+Requirements: Windows 10/11, Python >= 3.11 (`winget install Python.Python.3.12`),
+Claude Code with Git Bash (Claude Code runs the `csw` hooks through it).
+
+```powershell
+git clone https://github.com/Marcejr117/claude-code-switcher.git
+cd claude-code-switcher
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Same layout as Linux (`%USERPROFILE%\.local\bin\csw` plus a `csw.cmd` launcher,
+modules in `%USERPROFILE%\.local\share\csw`); the installer adds `.local\bin` to
+the user `PATH`. Differences from Linux:
+
+- Background services (DeepSeek adapter, Codex/Cursor proxy) are started on
+  demand as detached processes instead of systemd units; pid and log files live
+  in `~/.claude/services`. `install.ps1 -WithProxy` builds `claude-code-proxy.exe`.
+- File modes (`0600`) do not apply; profiles rely on the user profile ACL.
+- `csw rm` cannot see the environment of Claude sessions started without csw,
+  so close those yourself before removing an account (sessions opened with
+  `csw run` are still detected).
+- Optional `claude` wrapper for PowerShell: add
+  `. "$HOME\.local\share\csw\csw.ps1"` to your `$PROFILE`.
+
+Before the first switch, save your current Claude subscription as the primary
+profile so you can come back to it: `csw save CLAUDE.bak "Claude Max"`.
+
 Optional pieces in `contrib/`:
 
 - `csw.sh` — a `claude()` shell wrapper that routes every launch through
@@ -112,7 +140,8 @@ may violate those providers' terms of service. Use it at your own risk.
 
 ## Tests
 
-209 unit tests, all synthetic (no network, no real credentials):
+211 unit tests, all synthetic (no network, no real credentials); they pass on
+Linux and Windows (`python` instead of `python3` there):
 
 ```sh
 cd tests && python3 -m unittest test_csw test_hot test_shared test_ui \

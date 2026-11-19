@@ -30,6 +30,10 @@ class ProfilesTest(unittest.TestCase):
             p = patch.object(csw, name, value)
             p.start()
             self.addCleanup(p.stop)
+        # Service assertions describe the systemd calls; Windows has its own test below.
+        p = patch.object(csw.portable_module(), "WINDOWS", False)
+        p.start()
+        self.addCleanup(p.stop)
         self.direct = {
             "env": {"ANTHROPIC_AUTH_TOKEN": "test-deepseek-key", "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
                     "ANTHROPIC_MODEL": "deepseek-v4-pro", "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "786432",
@@ -125,7 +129,8 @@ class ProfilesTest(unittest.TestCase):
     def test_private_atomic_files(self):
         csw.switch("claude")
         for path in (csw.LIVE, csw.ACTIVE, csw.ROOT / csw.ALIASES["deepseek"]):
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            if os.name != "nt":  # POSIX modes only; Windows relies on the profile ACL
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(list(csw.ROOT.glob(".csw-*")), [])
 
     def test_rejects_paths_symlinks_and_bad_indices(self):
@@ -173,10 +178,11 @@ class ProfilesTest(unittest.TestCase):
         second = csw.read_json(csw.resolve("codex:personal"))
         self.assertNotEqual(first["env"]["ANTHROPIC_BASE_URL"], second["env"]["ANTHROPIC_BASE_URL"])
         _, env, unit = csw.proxy_context(first)
-        self.assertTrue(env["CCP_CONFIG_DIR"].endswith("accounts/codex-work"))
+        self.assertTrue(Path(env["CCP_CONFIG_DIR"]).as_posix().endswith("accounts/codex-work"))
         self.assertEqual(unit, "claude-code-proxy@codex-work.service")
         self.assertEqual(before, csw.LIVE.read_bytes())
-        self.assertEqual((csw.CONFIG_ROOT / "accounts/codex-work").stat().st_mode & 0o777, 0o700)
+        if os.name != "nt":  # POSIX modes only; Windows relies on the profile ACL
+            self.assertEqual((csw.CONFIG_ROOT / "accounts/codex-work").stat().st_mode & 0o777, 0o700)
         self.assertIn(csw.resolve("codex:work").name, csw.profiles())
 
     def test_account_relogin_selects_own_store(self):
@@ -185,7 +191,7 @@ class ProfilesTest(unittest.TestCase):
         with patch.object(csw.subprocess, "call", return_value=0) as call, patch.object(csw.subprocess, "run") as run:
             csw.login("codex:work")
         self.assertEqual(call.call_args.args[0], ["claude-code-proxy", "codex", "auth", "device"])
-        self.assertTrue(call.call_args.kwargs["env"]["CCP_CONFIG_DIR"].endswith("accounts/codex-work"))
+        self.assertTrue(Path(call.call_args.kwargs["env"]["CCP_CONFIG_DIR"]).as_posix().endswith("accounts/codex-work"))
         self.assertIn("claude-code-proxy@codex-work.service", run.call_args.args[0])
 
     def test_codex_browser_login_requires_explicit_option(self):
@@ -252,7 +258,8 @@ class ProfilesTest(unittest.TestCase):
             csw.add_account("deepseek", "second")
         profile = csw.resolve("deepseek:second")
         self.assertEqual(csw.read_json(profile)["env"]["ANTHROPIC_AUTH_TOKEN"], "new-key")
-        self.assertEqual(profile.stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":  # POSIX modes only; Windows relies on the profile ACL
+            self.assertEqual(profile.stat().st_mode & 0o777, 0o600)
         self.assertEqual(csw.read_json(csw.LIVE)["env"]["ANTHROPIC_AUTH_TOKEN"], "test-deepseek-key")
 
     def test_empty_api_key_creates_nothing(self):
@@ -274,7 +281,8 @@ class ProfilesTest(unittest.TestCase):
         with patch.object(csw.urllib.request, "urlopen", return_value=listing):
             models = [row["model"] for row in csw.model_catalog(profile, data)["models"]]
         self.assertEqual(models, ["orcarouter/auto", "anthropic/claude-sonnet-5"])
-        self.assertEqual(profile.stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":  # POSIX modes only; Windows relies on the profile ACL
+            self.assertEqual(profile.stat().st_mode & 0o777, 0o600)
         self.assertEqual(csw.read_json(csw.LIVE)["env"]["ANTHROPIC_AUTH_TOKEN"], "test-deepseek-key")
 
     def test_add_accounts_on_fresh_install_uses_builtin_templates(self):
@@ -333,7 +341,7 @@ class ProfilesTest(unittest.TestCase):
         seen = {}
         def launch(command, env):
             self.assertEqual(command[0], csw.CLAUDE_BIN)
-            self.assertTrue(env["CLAUDE_CONFIG_DIR"].endswith("accounts/claude/max2"))
+            self.assertTrue(Path(env["CLAUDE_CONFIG_DIR"]).as_posix().endswith("accounts/claude/max2"))
             self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
             seen["snapshot"] = Path(command[command.index("--settings") + 1])
             data = csw.read_json(seen["snapshot"])
@@ -356,7 +364,7 @@ class ProfilesTest(unittest.TestCase):
         with patch.object(csw.subprocess, "call", return_value=0) as call:
             csw.run_claude(["--", "hello world"])
         self.assertEqual(call.call_args.args[0][-1], "hello world")
-        self.assertTrue(call.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"].endswith("accounts/claude/max2"))
+        self.assertTrue(Path(call.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"]).as_posix().endswith("accounts/claude/max2"))
 
     def test_run_auth_login_ignores_selected_api_credentials(self):
         with patch.object(csw.subprocess, "call", return_value=0) as call:
@@ -419,7 +427,8 @@ class ProfilesTest(unittest.TestCase):
             self.assertEqual(fetch.call_count, 1)
             csw.model_catalog(path, self.proxy, refresh=True)
             self.assertEqual(fetch.call_count, 2)
-        self.assertEqual(csw.model_cache(path).stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":  # POSIX modes only; Windows relies on the profile ACL
+            self.assertEqual(csw.model_cache(path).stat().st_mode & 0o777, 0o600)
 
     def test_cursor_catalog_uses_only_access_token_in_child_environment(self):
         target = copy.deepcopy(self.proxy)
@@ -472,7 +481,8 @@ class ProfilesTest(unittest.TestCase):
         self.assertFalse(profile.exists())
         self.assertNotIn(profile.name, csw.names())
         archive = next((csw.ROOT / "removed-accounts").iterdir())
-        self.assertEqual(archive.stat().st_mode & 0o777, 0o700)
+        if os.name != "nt":  # POSIX modes only; Windows relies on the profile ACL
+            self.assertEqual(archive.stat().st_mode & 0o777, 0o700)
         self.assertEqual((archive / "profile.json").read_bytes(), original)
         csw.restore_account(archive.name)
         self.assertEqual(profile.read_bytes(), original)
@@ -706,6 +716,25 @@ class ProfilesTest(unittest.TestCase):
                 self.assertEqual(csw.run_claude(["codex", "--", *arguments, "-p", "test"]), 0)
         self.assertEqual(csw.LIVE.read_bytes(), before)
         self.assertEqual(profile.read_bytes(), profile_before)
+
+
+@unittest.skipUnless(os.name == "nt", "Windows service emulation")
+class WindowsServiceTest(unittest.TestCase):
+    def test_start_status_stop_tracks_a_real_detached_process(self):
+        portable = csw.portable_module()
+        with tempfile.TemporaryDirectory(prefix="csw-svc-") as folder:
+            unit, root = "csw-deepseek-compat.service", Path(folder)
+            run = lambda *a, **k: portable.systemctl(list(a), root, root / "proxy", **k)
+            self.assertEqual(run("is-active", unit).returncode, 3)
+            run("start", unit, check=True)
+            self.addCleanup(run, "stop", unit)
+            self.assertEqual(run("is-active", unit).returncode, 0)
+            pid = (root / "services" / (unit + ".pid")).read_text().split()[0]
+            run("start", unit, check=True)  # already running: no second process
+            self.assertEqual((root / "services" / (unit + ".pid")).read_text().split()[0], pid)
+            run("disable", "--now", unit, check=True)
+            self.assertEqual(run("is-active", unit).returncode, 3)
+            self.assertIsNone(portable.process_start(pid))
 
 
 if __name__ == "__main__":

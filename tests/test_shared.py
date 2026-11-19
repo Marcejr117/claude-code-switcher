@@ -35,7 +35,7 @@ class SharedTest(unittest.TestCase):
         self.assertEqual(csw.normalize_model("opus", {"model": "opus", "env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": ""}}), "opus[1m]")
 
     def test_shared_launch_passes_no_snapshot_or_account_env(self):
-        with patch.dict(os.environ, {"ANTHROPIC_AUTH_TOKEN": "stale", "CSW_SHARED_DISABLED": "1", "CSW_HOT_ID": "old"}), patch.object(csw.os, "execvpe", return_value=0) as launch:
+        with patch.dict(os.environ, {"ANTHROPIC_AUTH_TOKEN": "stale", "CSW_SHARED_DISABLED": "1", "CSW_HOT_ID": "old"}), patch.object(csw, "exec_claude", return_value=0) as launch:
             self.assertEqual(csw.main(["launch", "--", "--resume"]), 0)
         self.assertEqual(launch.call_args.args[1], [csw.CLAUDE_BIN, "--resume", "--model", "deepseek-v4-pro[1m]"])
         env = launch.call_args.args[2]
@@ -59,7 +59,7 @@ class SharedTest(unittest.TestCase):
 
     def test_native_management_commands_do_not_receive_model_flags(self):
         for arguments in (["--help"], ["--version"], ["mcp", "list"], ["logs", "example"], ["agents", "list"]):
-            with patch.object(csw, "read_json", side_effect=AssertionError("No provider needed")), patch.object(csw.os, "execvpe", return_value=0) as launch:
+            with patch.object(csw, "read_json", side_effect=AssertionError("No provider needed")), patch.object(csw, "exec_claude", return_value=0) as launch:
                 csw.launch_claude(arguments)
             self.assertEqual(launch.call_args.args[1], [csw.CLAUDE_BIN, *arguments])
 

@@ -7,7 +7,6 @@ Claude access tokens are read from their owning account, never refresh tokens.
 import contextlib
 import copy
 from datetime import datetime
-import fcntl
 import importlib.machinery
 import importlib.util
 import json
@@ -21,6 +20,9 @@ import sys
 import time
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import portable  # noqa: E402
+
 EVENTS = ("SessionStart", "UserPromptSubmit", "Stop", "StopFailure", "SubagentStart",
           "SubagentStop", "PreModelSwitch", "PostModelSwitch")
 LABELS = {"Codex": "OpenAI / Codex", "Claude sub": "Claude / Max", "Cursor": "Cursor",
@@ -29,7 +31,7 @@ ORDER = list(LABELS)
 
 
 def load_api():
-    loader = importlib.machinery.SourceFileLoader("csw_hot_api", str(Path.home() / ".local/bin/csw"))
+    loader = importlib.machinery.SourceFileLoader("csw_hot_api", str(portable.CSW_BIN))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     api = importlib.util.module_from_spec(spec)
     loader.exec_module(api)
@@ -37,12 +39,7 @@ def load_api():
 
 
 def process_identity(pid):
-    try:
-        # comm can contain spaces and parentheses; starttime is field 22.
-        fields = Path(f"/proc/{int(pid)}/stat").read_text().rsplit(")", 1)[1].split()
-        return fields[19] if fields[0] != "Z" else None
-    except (OSError, ValueError, IndexError, TypeError):
-        return None
+    return portable.process_start(pid)
 
 
 def running(state):
@@ -65,7 +62,7 @@ def session_path(api, identifier):
 @contextlib.contextmanager
 def session_lock(directory):
     with (directory / ".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        portable.flock(lock)
         yield
 
 
