@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -30,6 +31,10 @@ class ProfilesTest(unittest.TestCase):
             p = patch.object(csw, name, value)
             p.start()
             self.addCleanup(p.stop)
+        # Service assertions describe the systemd calls; Windows has its own test below.
+        p = patch.object(csw.portable_module(), "WINDOWS", False)
+        p.start()
+        self.addCleanup(p.stop)
         self.direct = {
             "env": {"ANTHROPIC_AUTH_TOKEN": "test-deepseek-key", "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
                     "ANTHROPIC_MODEL": "deepseek-v4-pro", "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "786432",
@@ -65,9 +70,39 @@ class ProfilesTest(unittest.TestCase):
         self.assertEqual(data["hooks"]["SessionStart"][0], "new-hook")
         self.assertEqual(data["env"]["SHARED_PATH"], "/new/path")
         self.assertEqual(data["env"]["ANTHROPIC_AUTH_TOKEN"], "")
-        self.assertEqual(data["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "synthetic-native-access")
+        # The primary login is Claude Code's own: no pinned token or endpoint.
+        self.assertEqual(data["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "")
+        self.assertEqual(data["env"]["ANTHROPIC_BASE_URL"], "")
         self.assertEqual(data["model"], "opus[1m]")
         self.assertEqual(csw.active(), csw.ALIASES["claude"])
+
+    def test_republishing_primary_claude_drops_a_previously_pinned_token(self):
+        csw.switch("claude")
+        live = csw.read_json(csw.LIVE)
+        live["env"].update(CLAUDE_CODE_OAUTH_TOKEN="old-pinned", CLAUDE_CODE_OAUTH_SCOPES="user:inference",
+                           ANTHROPIC_BASE_URL="https://api.anthropic.com")
+        csw.write_json(csw.LIVE, live)
+        csw.switch("claude")
+        env = csw.read_json(csw.LIVE)["env"]
+        self.assertEqual((env["CLAUDE_CODE_OAUTH_TOKEN"], env["CLAUDE_CODE_OAUTH_SCOPES"], env["ANTHROPIC_BASE_URL"]),
+                         ("", "", ""))
+
+    def test_native_switch_declares_oauth_scopes_and_other_providers_clear_them(self):
+        # A pinned token (extra Claude account) needs its scopes declared, or Claude
+        # assumes user:inference and disables Claude in Chrome.
+        csw.write_json(csw.ROOT / "settings.json.CLAUDE.work.bak", self.native)
+        (csw.ROOT / "accounts/claude/work").mkdir(parents=True)
+        csw.write_json(csw.ROOT / "accounts/claude/work/.credentials.json", {"claudeAiOauth": {
+            "accessToken": "work-access", "expiresAt": (csw.time.time() + 3600) * 1000,
+            "scopes": ["user:inference", "user:profile"]}})
+        csw.switch("claude:work")
+        self.assertEqual(csw.read_json(csw.LIVE)["env"]["CLAUDE_CODE_OAUTH_SCOPES"], "user:inference user:profile")
+        csw.switch("claude")  # the primary login pins nothing, so it declares nothing
+        self.assertEqual(csw.read_json(csw.LIVE)["env"]["CLAUDE_CODE_OAUTH_SCOPES"], "")
+        csw.switch("claude:work")
+        self.assertEqual(csw.launch_overlay(csw.selected_data(csw.resolve("deepseek")), csw.read_json(csw.LIVE))["env"]["CLAUDE_CODE_OAUTH_SCOPES"], "")
+        csw.switch("deepseek")
+        self.assertEqual(csw.read_json(csw.LIVE)["env"]["CLAUDE_CODE_OAUTH_SCOPES"], "")
 
     def test_roundtrip_keeps_edits_and_correct_provider(self):
         csw.switch("claude")
@@ -125,7 +160,8 @@ class ProfilesTest(unittest.TestCase):
     def test_private_atomic_files(self):
         csw.switch("claude")
         for path in (csw.LIVE, csw.ACTIVE, csw.ROOT / csw.ALIASES["deepseek"]):
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            if os.name != "nt":  # POSIX modes only; Windows relies on the profile ACL
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(list(csw.ROOT.glob(".csw-*")), [])
 
     def test_rejects_paths_symlinks_and_bad_indices(self):
@@ -173,10 +209,11 @@ class ProfilesTest(unittest.TestCase):
         second = csw.read_json(csw.resolve("codex:personal"))
         self.assertNotEqual(first["env"]["ANTHROPIC_BASE_URL"], second["env"]["ANTHROPIC_BASE_URL"])
         _, env, unit = csw.proxy_context(first)
-        self.assertTrue(env["CCP_CONFIG_DIR"].endswith("accounts/codex-work"))
+        self.assertTrue(Path(env["CCP_CONFIG_DIR"]).as_posix().endswith("accounts/codex-work"))
         self.assertEqual(unit, "claude-code-proxy@codex-work.service")
         self.assertEqual(before, csw.LIVE.read_bytes())
-        self.assertEqual((csw.CONFIG_ROOT / "accounts/codex-work").stat().st_mode & 0o777, 0o700)
+        if os.name != "nt":  # POSIX modes only; Windows relies on the profile ACL
+            self.assertEqual((csw.CONFIG_ROOT / "accounts/codex-work").stat().st_mode & 0o777, 0o700)
         self.assertIn(csw.resolve("codex:work").name, csw.profiles())
 
     def test_account_relogin_selects_own_store(self):
@@ -185,7 +222,7 @@ class ProfilesTest(unittest.TestCase):
         with patch.object(csw.subprocess, "call", return_value=0) as call, patch.object(csw.subprocess, "run") as run:
             csw.login("codex:work")
         self.assertEqual(call.call_args.args[0], ["claude-code-proxy", "codex", "auth", "device"])
-        self.assertTrue(call.call_args.kwargs["env"]["CCP_CONFIG_DIR"].endswith("accounts/codex-work"))
+        self.assertTrue(Path(call.call_args.kwargs["env"]["CCP_CONFIG_DIR"]).as_posix().endswith("accounts/codex-work"))
         self.assertIn("claude-code-proxy@codex-work.service", run.call_args.args[0])
 
     def test_codex_browser_login_requires_explicit_option(self):
@@ -252,7 +289,8 @@ class ProfilesTest(unittest.TestCase):
             csw.add_account("deepseek", "second")
         profile = csw.resolve("deepseek:second")
         self.assertEqual(csw.read_json(profile)["env"]["ANTHROPIC_AUTH_TOKEN"], "new-key")
-        self.assertEqual(profile.stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":  # POSIX modes only; Windows relies on the profile ACL
+            self.assertEqual(profile.stat().st_mode & 0o777, 0o600)
         self.assertEqual(csw.read_json(csw.LIVE)["env"]["ANTHROPIC_AUTH_TOKEN"], "test-deepseek-key")
 
     def test_empty_api_key_creates_nothing(self):
@@ -274,7 +312,8 @@ class ProfilesTest(unittest.TestCase):
         with patch.object(csw.urllib.request, "urlopen", return_value=listing):
             models = [row["model"] for row in csw.model_catalog(profile, data)["models"]]
         self.assertEqual(models, ["orcarouter/auto", "anthropic/claude-sonnet-5"])
-        self.assertEqual(profile.stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":  # POSIX modes only; Windows relies on the profile ACL
+            self.assertEqual(profile.stat().st_mode & 0o777, 0o600)
         self.assertEqual(csw.read_json(csw.LIVE)["env"]["ANTHROPIC_AUTH_TOKEN"], "test-deepseek-key")
 
     def test_add_accounts_on_fresh_install_uses_builtin_templates(self):
@@ -301,12 +340,16 @@ class ProfilesTest(unittest.TestCase):
         data = csw.read_json(profile)
         listing = io.BytesIO(json.dumps({"data": [
             {"id": "orcarouter/auto"},
-            {"id": "orca/orcacyber-glm-5.3-flash", "context_length": 1048576},
+            {"id": "orca/orcacyber-glm-5.3-flash", "context_length": 1048576,
+             "name": "OrcaCyber: GLM 5.3 Flash Abliterated / Uncensored"},
             {"id": "grok/grok-4.5", "context_length": 500000},
             {"id": "orcarouter/pod"}], "has_more": False}).encode())
         with patch.object(csw.urllib.request, "urlopen", return_value=listing) as fetch:
-            csw.model_catalog(profile, data)
+            catalog = csw.model_catalog(profile, data)
         self.assertNotIn("Anthropic-version", fetch.call_args[0][0].headers)
+        labels = {row["model"]: row["label"] for row in catalog["models"]}
+        self.assertEqual(labels["orca/orcacyber-glm-5.3-flash"], "OrcaCyber: GLM 5.3 Flash Abliterated / Uncensored")
+        self.assertEqual(labels["orcarouter/pod"], "orcarouter/pod")  # no display_name: the id
         self.assertEqual(csw.documented_context("orca/orcacyber-glm-5.3-flash", data), 1048576)
         self.assertIsNone(csw.documented_context("orcarouter/pod", data))
         self.assertEqual(csw.preferred_context_model("orca/orcacyber-glm-5.3-flash", data),
@@ -331,9 +374,9 @@ class ProfilesTest(unittest.TestCase):
         with patch.object(csw, "login", return_value=0):
             csw.add_account("claude", "max2")
         seen = {}
-        def launch(command, env):
+        def launch(command, env, tick=None):
             self.assertEqual(command[0], csw.CLAUDE_BIN)
-            self.assertTrue(env["CLAUDE_CONFIG_DIR"].endswith("accounts/claude/max2"))
+            self.assertTrue(Path(env["CLAUDE_CONFIG_DIR"]).as_posix().endswith("accounts/claude/max2"))
             self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
             seen["snapshot"] = Path(command[command.index("--settings") + 1])
             data = csw.read_json(seen["snapshot"])
@@ -343,7 +386,7 @@ class ProfilesTest(unittest.TestCase):
             self.assertNotIn("hooks", data)
             self.assertEqual(command[command.index("--setting-sources") + 1], "user,project,local")
             return 0
-        with patch.object(csw.subprocess, "call", side_effect=launch):
+        with patch.object(csw, "run_child", side_effect=launch):
             self.assertEqual(csw.run_claude(["claude:max2", "--", "-p", "test"]), 0)
         self.assertEqual(before, csw.LIVE.read_bytes())
         self.assertFalse(seen["snapshot"].exists())
@@ -353,10 +396,41 @@ class ProfilesTest(unittest.TestCase):
             csw.add_account("claude", "max2")
         csw.write_json(csw.ROOT / "accounts/claude/max2/.credentials.json", csw.read_json(csw.ROOT / ".credentials.json"))
         csw.switch("claude:max2")
-        with patch.object(csw.subprocess, "call", return_value=0) as call:
+        with patch.object(csw, "run_child", return_value=0) as call:
             csw.run_claude(["--", "hello world"])
         self.assertEqual(call.call_args.args[0][-1], "hello world")
-        self.assertTrue(call.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"].endswith("accounts/claude/max2"))
+        self.assertTrue(Path(call.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"]).as_posix().endswith("accounts/claude/max2"))
+
+    def test_run_default_model_choice_stays_out_of_shared_settings(self):
+        csw.switch("claude")
+        before = csw.read_json(csw.LIVE).get("model")
+        profile = csw.resolve("codex")
+
+        def set_live_model(model):
+            live = csw.read_json(csw.LIVE)
+            live["model"] = model
+            csw.write_json(csw.LIVE, live)
+
+        def launch(command, env, tick=None):
+            set_live_model("gpt-6.2-astra")  # Claude saving "/model … set as default"
+            tick()
+            self.assertEqual(csw.read_json(csw.LIVE).get("model"), before)
+            set_live_model("sonnet")  # another native session's own default stays
+            tick()
+            self.assertEqual(csw.read_json(csw.LIVE)["model"], "sonnet")
+            return 0
+
+        with patch.object(csw, "check_proxy"), patch.object(csw, "configure_model_picker"), \
+                patch.object(csw, "run_child", side_effect=launch):
+            self.assertEqual(csw.run_claude(["codex", "--", "-p", "test"]), 0)
+        self.assertEqual(csw.read_json(profile)["model"], "gpt-6.2-astra")
+
+    def test_run_child_waits_for_claude_and_ticks(self):
+        ticks = []
+        code = csw.run_child([sys.executable, "-c", "import time; time.sleep(1.5); raise SystemExit(3)"],
+                             env=os.environ.copy(), tick=lambda: ticks.append(1))
+        self.assertEqual(code, 3)
+        self.assertGreaterEqual(len(ticks), 2)  # while running and once at exit
 
     def test_run_auth_login_ignores_selected_api_credentials(self):
         with patch.object(csw.subprocess, "call", return_value=0) as call:
@@ -409,6 +483,21 @@ class ProfilesTest(unittest.TestCase):
         self.assertTrue(target["modelPicker"]["replaceBuiltInOptions"])
         self.assertEqual(target["modelPicker"]["options"][0], {"model": "gpt-6-astra", "label": "Codex · Astra", "description": "gpt-6-astra · contexto 272K"})
 
+    def test_codex_picker_mirrors_codex_cli_catalog_without_the_proxy(self):
+        csw.write_json(csw.CODEX_NATIVE_CATALOG, {"models": [
+            {"slug": "gpt-daybreak-blue-latest", "display_name": "Daybreak Blue", "visibility": "list", "supported_in_api": True, "priority": 12},
+            {"slug": "gpt-6.2-sol", "display_name": "GPT-6.2-Sol", "visibility": "list", "supported_in_api": True, "priority": 1},
+            {"slug": "gpt-reserve", "display_name": "GPT-Reserve", "visibility": "hide", "supported_in_api": True, "priority": 4},
+            {"slug": "gpt-no-api", "visibility": "list", "supported_in_api": False, "priority": 2},
+            {"slug": "codex-auto-review", "visibility": "list", "supported_in_api": True, "priority": 3},
+            {"slug": "gpt-6.1-terra", "display_name": "GPT-6.1 Terra", "visibility": "list", "supported_in_api": True, "priority": 3},
+        ]})
+        with patch.object(csw.subprocess, "run", side_effect=AssertionError("proxy not needed")):
+            catalog = csw.fetch_model_catalog(csw.resolve("codex"), self.proxy)
+        self.assertEqual([(r["model"], r["label"]) for r in catalog["models"]],
+                         [("gpt-6.2-sol", "GPT-6.2-Sol"), ("gpt-6.1-terra", "GPT-6.1 Terra"),
+                          ("gpt-daybreak-blue-latest", "Daybreak Blue")])
+
     def test_catalog_cache_is_per_account_and_refreshes_explicitly(self):
         path = csw.resolve("codex")
         csw.model_cache(path).unlink()
@@ -419,7 +508,8 @@ class ProfilesTest(unittest.TestCase):
             self.assertEqual(fetch.call_count, 1)
             csw.model_catalog(path, self.proxy, refresh=True)
             self.assertEqual(fetch.call_count, 2)
-        self.assertEqual(csw.model_cache(path).stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":  # POSIX modes only; Windows relies on the profile ACL
+            self.assertEqual(csw.model_cache(path).stat().st_mode & 0o777, 0o600)
 
     def test_cursor_catalog_uses_only_access_token_in_child_environment(self):
         target = copy.deepcopy(self.proxy)
@@ -472,7 +562,8 @@ class ProfilesTest(unittest.TestCase):
         self.assertFalse(profile.exists())
         self.assertNotIn(profile.name, csw.names())
         archive = next((csw.ROOT / "removed-accounts").iterdir())
-        self.assertEqual(archive.stat().st_mode & 0o777, 0o700)
+        if os.name != "nt":  # POSIX modes only; Windows relies on the profile ACL
+            self.assertEqual(archive.stat().st_mode & 0o777, 0o700)
         self.assertEqual((archive / "profile.json").read_bytes(), original)
         csw.restore_account(archive.name)
         self.assertEqual(profile.read_bytes(), original)
@@ -580,19 +671,19 @@ class ProfilesTest(unittest.TestCase):
         self.assertEqual(local_rules.read_text(), "keep local rule")
 
     def test_mcp_administration_loads_user_scope_without_needing_provider_login(self):
-        with patch.object(csw, "check_proxy", side_effect=AssertionError("unnecessary provider login")), patch.object(csw, "configure_model_picker", side_effect=AssertionError("unnecessary catalog fetch")), patch.object(csw.subprocess, "call", return_value=0) as call:
+        with patch.object(csw, "check_proxy", side_effect=AssertionError("unnecessary provider login")), patch.object(csw, "configure_model_picker", side_effect=AssertionError("unnecessary catalog fetch")), patch.object(csw, "run_child", return_value=0) as call:
             self.assertEqual(csw.run_claude(["codex", "--", "mcp", "list"]), 0)
         self.assertEqual(call.call_args.args[0][1:3], ["--setting-sources", "user,project,local"])
         self.assertEqual(call.call_args.args[0][-2:], ["mcp", "list"])
 
     def test_extra_settings_do_not_discard_provider_isolation(self):
         seen = {}
-        def launch(command, env):
+        def launch(command, env, tick=None):
             self.assertEqual(command.count("--settings"), 1)
             data = csw.read_json(Path(command[command.index("--settings") + 1]))
             seen.update(data)
             return 0
-        with patch.object(csw.subprocess, "call", side_effect=launch):
+        with patch.object(csw, "run_child", side_effect=launch):
             csw.run_claude(["claude", "--", "--settings", '{"disableAllHooks":true,"env":{"EXTRA_TEST":"yes"}}', '-p', 'test'])
         self.assertTrue(seen["disableAllHooks"])
         self.assertEqual(seen["env"]["ANTHROPIC_AUTH_TOKEN"], "")
@@ -694,7 +785,7 @@ class ProfilesTest(unittest.TestCase):
         profile = csw.ROOT / csw.ALIASES["codex"]
         profile_before = profile.read_bytes()
 
-        def launch(command, env):
+        def launch(command, env, tick=None):
             data = csw.read_json(Path(command[command.index("--settings") + 1]))
             for values in (env, data["env"]):
                 self.assertEqual(values["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "272000")
@@ -702,10 +793,71 @@ class ProfilesTest(unittest.TestCase):
             return 0
 
         for arguments in (["--model", "gpt-5.5"], ["--model=gpt-5.5"]):
-            with self.subTest(arguments=arguments), patch.object(csw, "check_proxy"), patch.object(csw, "configure_model_picker"), patch.object(csw.subprocess, "call", side_effect=launch):
+            with self.subTest(arguments=arguments), patch.object(csw, "check_proxy"), patch.object(csw, "configure_model_picker"), patch.object(csw, "run_child", side_effect=launch):
                 self.assertEqual(csw.run_claude(["codex", "--", *arguments, "-p", "test"]), 0)
         self.assertEqual(csw.LIVE.read_bytes(), before)
         self.assertEqual(profile.read_bytes(), profile_before)
+
+
+@unittest.skipUnless(os.name == "nt", "Windows service emulation")
+class WindowsServiceTest(unittest.TestCase):
+    def setUp(self):
+        # Never touch the real logon Run key from tests.
+        import winreg
+        portable = csw.portable_module()
+        p = patch.object(portable, "RUN_KEY", r"Software\csw-test-run")
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(lambda: winreg.DeleteKey(winreg.HKEY_CURRENT_USER, r"Software\csw-test-run")
+                        if self._key_exists() else None)
+
+    @staticmethod
+    def _key_exists():
+        import winreg
+        try:
+            winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\csw-test-run").Close()
+            return True
+        except FileNotFoundError:
+            return False
+
+    def test_enable_registers_a_windowless_logon_start_and_disable_removes_it(self):
+        import shlex, winreg
+        portable = csw.portable_module()
+        with tempfile.TemporaryDirectory(prefix="csw-svc-") as folder:
+            unit, root = "csw-deepseek-compat.service", Path(folder)
+            run = lambda *a, **k: portable.systemctl(list(a), root, root / "proxy", **k)
+            self.assertEqual(run("is-enabled", unit).returncode, 1)
+            run("enable", unit, check=True)
+            self.addCleanup(run, "disable", "--now", unit)
+            self.assertEqual(run("is-enabled", unit).returncode, 0)
+            self.assertEqual(run("is-active", unit).returncode, 3)  # enable alone does not start
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\csw-test-run") as key:
+                command, _ = winreg.QueryValueEx(key, "csw " + unit)
+            argv = shlex.split(command, posix=False)
+            self.assertTrue(argv[0].strip('"').lower().endswith("pythonw.exe"), argv[0])
+            # What Windows runs at logon starts the unit.
+            subprocess_args = [sys.executable] + [a.strip('"') for a in argv[1:]]
+            self.assertEqual(csw.subprocess.run(subprocess_args, timeout=30).returncode, 0)
+            self.assertEqual(run("is-active", unit).returncode, 0)
+            run("disable", "--now", unit, check=True)
+            self.assertEqual(run("is-enabled", unit).returncode, 1)
+            self.assertEqual(run("is-active", unit).returncode, 3)
+
+    def test_start_status_stop_tracks_a_real_detached_process(self):
+        portable = csw.portable_module()
+        with tempfile.TemporaryDirectory(prefix="csw-svc-") as folder:
+            unit, root = "csw-deepseek-compat.service", Path(folder)
+            run = lambda *a, **k: portable.systemctl(list(a), root, root / "proxy", **k)
+            self.assertEqual(run("is-active", unit).returncode, 3)
+            run("start", unit, check=True)
+            self.addCleanup(run, "stop", unit)
+            self.assertEqual(run("is-active", unit).returncode, 0)
+            pid = (root / "services" / (unit + ".pid")).read_text().split()[0]
+            run("start", unit, check=True)  # already running: no second process
+            self.assertEqual((root / "services" / (unit + ".pid")).read_text().split()[0], pid)
+            run("disable", "--now", unit, check=True)
+            self.assertEqual(run("is-active", unit).returncode, 3)
+            self.assertIsNone(portable.process_start(pid))
 
 
 if __name__ == "__main__":

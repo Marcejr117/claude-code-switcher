@@ -7,7 +7,6 @@ Claude access tokens are read from their owning account, never refresh tokens.
 import contextlib
 import copy
 from datetime import datetime
-import fcntl
 import importlib.machinery
 import importlib.util
 import json
@@ -21,6 +20,9 @@ import sys
 import time
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import portable  # noqa: E402
+
 EVENTS = ("SessionStart", "UserPromptSubmit", "Stop", "StopFailure", "SubagentStart",
           "SubagentStop", "PreModelSwitch", "PostModelSwitch")
 LABELS = {"Codex": "OpenAI / Codex", "Claude sub": "Claude / Max", "Cursor": "Cursor",
@@ -29,7 +31,7 @@ ORDER = list(LABELS)
 
 
 def load_api():
-    loader = importlib.machinery.SourceFileLoader("csw_hot_api", str(Path.home() / ".local/bin/csw"))
+    loader = importlib.machinery.SourceFileLoader("csw_hot_api", str(portable.CSW_BIN))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     api = importlib.util.module_from_spec(spec)
     loader.exec_module(api)
@@ -37,12 +39,7 @@ def load_api():
 
 
 def process_identity(pid):
-    try:
-        # comm can contain spaces and parentheses; starttime is field 22.
-        fields = Path(f"/proc/{int(pid)}/stat").read_text().rsplit(")", 1)[1].split()
-        return fields[19] if fields[0] != "Z" else None
-    except (OSError, ValueError, IndexError, TypeError):
-        return None
+    return portable.process_start(pid)
 
 
 def running(state):
@@ -65,7 +62,7 @@ def session_path(api, identifier):
 @contextlib.contextmanager
 def session_lock(directory):
     with (directory / ".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        portable.flock(lock)
         yield
 
 
@@ -380,11 +377,25 @@ def choose_session(api, identifier=None):
     ])
 
 
-def oauth_access(api, profile):
+def oauth_store(api, profile):
     directory, _ = api.account_directory(profile)
     directory = directory if directory is not None else api.ROOT
+    return api.read_json(directory / ".credentials.json").get("claudeAiOauth", {})
+
+
+def oauth_scopes(api, profile):
+    # Claude treats an env-var token as user:inference only, which turns off
+    # scope-gated features such as Claude in Chrome. Declare the login's real scopes.
     try:
-        data = api.read_json(directory / ".credentials.json").get("claudeAiOauth", {})
+        scopes = oauth_store(api, profile).get("scopes")
+    except (OSError, ValueError):
+        return ""
+    return " ".join(s for s in scopes if isinstance(s, str)) if isinstance(scopes, list) else ""
+
+
+def oauth_access(api, profile):
+    try:
+        data = oauth_store(api, profile)
         token, expires = data.get("accessToken"), data.get("expiresAt")
         if not isinstance(token, str) or not token or not isinstance(expires, (int, float)):
             raise ValueError("Falta una sesión OAuth válida")
@@ -398,7 +409,9 @@ def oauth_access(api, profile):
 def credentials(api, profile, target):
     result = api.provider_transport(target)
     if api.provider(target) == "Claude sub":
-        result.setdefault("env", {})["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_access(api, profile)
+        env = result.setdefault("env", {})
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_access(api, profile)
+        env["CLAUDE_CODE_OAUTH_SCOPES"] = oauth_scopes(api, profile)
     return result
 
 
@@ -517,6 +530,7 @@ def refresh_access(api, directory):
         if changed:
             state["revision"] += 1
             settings["env"]["CLAUDE_CODE_OAUTH_TOKEN"] = token
+            settings["env"]["CLAUDE_CODE_OAUTH_SCOPES"] = oauth_scopes(api, api.profile_path(state["profile"]))
             settings["env"]["CSW_HOT_REVISION"] = str(state["revision"])
             api.write_json(directory / "settings.json", settings)
         if state.get("auth_error") or changed:

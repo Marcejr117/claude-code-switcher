@@ -35,7 +35,7 @@ class SharedTest(unittest.TestCase):
         self.assertEqual(csw.normalize_model("opus", {"model": "opus", "env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": ""}}), "opus[1m]")
 
     def test_shared_launch_passes_no_snapshot_or_account_env(self):
-        with patch.dict(os.environ, {"ANTHROPIC_AUTH_TOKEN": "stale", "CSW_SHARED_DISABLED": "1", "CSW_HOT_ID": "old"}), patch.object(csw.os, "execvpe", return_value=0) as launch:
+        with patch.dict(os.environ, {"ANTHROPIC_AUTH_TOKEN": "stale", "CSW_SHARED_DISABLED": "1", "CSW_HOT_ID": "old"}), patch.object(csw, "exec_claude", return_value=0) as launch:
             self.assertEqual(csw.main(["launch", "--", "--resume"]), 0)
         self.assertEqual(launch.call_args.args[1], [csw.CLAUDE_BIN, "--resume", "--model", "deepseek-v4-pro[1m]"])
         env = launch.call_args.args[2]
@@ -55,11 +55,11 @@ class SharedTest(unittest.TestCase):
         self.assertEqual(csw.read_json(csw.LIVE)["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "work-access")
         self.assertNotIn("never-copy", csw.LIVE.read_text())
         csw.switch("claude")
-        self.assertEqual(csw.read_json(csw.LIVE)["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "synthetic-native-access")
+        self.assertEqual(csw.read_json(csw.LIVE)["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "")
 
     def test_native_management_commands_do_not_receive_model_flags(self):
         for arguments in (["--help"], ["--version"], ["mcp", "list"], ["logs", "example"], ["agents", "list"]):
-            with patch.object(csw, "read_json", side_effect=AssertionError("No provider needed")), patch.object(csw.os, "execvpe", return_value=0) as launch:
+            with patch.object(csw, "read_json", side_effect=AssertionError("No provider needed")), patch.object(csw, "exec_claude", return_value=0) as launch:
                 csw.launch_claude(arguments)
             self.assertEqual(launch.call_args.args[1], [csw.CLAUDE_BIN, *arguments])
 
@@ -310,14 +310,24 @@ class SharedTest(unittest.TestCase):
                         {**csw.read_json(csw.LIVE)["env"], "CSW_INITIAL_MODEL": "old-startup-model"})
         self.assertEqual(csw.read_json(csw.ROOT / "shared-sessions/after-clear.json")["model"], "deepseek-flash[1m]")
 
-    def test_active_native_relogin_republishes_only_its_access(self):
+    def test_active_native_relogin_republishes_without_pinning_access(self):
         csw.switch("claude")
         def login(command, env):
             csw.write_json(csw.ROOT / ".credentials.json", {"claudeAiOauth": {"accessToken": "renewed", "expiresAt": (csw.time.time() + 3600) * 1000}})
             return 0
         with patch.object(csw.subprocess, "call", side_effect=login):
             self.assertEqual(csw.login("claude"), 0)
-        self.assertEqual(csw.read_json(csw.LIVE)["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "renewed")
+        self.assertEqual(csw.read_json(csw.LIVE)["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "")
+        self.assertNotIn("renewed", csw.LIVE.read_text())
+
+    def test_primary_login_renewal_or_expiry_does_not_block_prompts(self):
+        csw.switch("claude")
+        self.payload["model"] = "opus[1m]"
+        self.hook("SessionStart")
+        # Claude Code renews its own token; an about-to-expire one is its business too.
+        csw.write_json(csw.ROOT / ".credentials.json", {"claudeAiOauth": {
+            "accessToken": "renewed-by-claude", "refreshToken": "r", "expiresAt": (csw.time.time() + 30) * 1000}})
+        self.assertEqual(self.hook("UserPromptSubmit"), {})
 
     def test_model_change_updates_codex_context_without_pinning_model(self):
         csw.write_json(csw.CODEX_NATIVE_CATALOG, {"models": [{"slug": "gpt-5.6-sol", "context_window": 272000, "max_context_window": 872000}, {"slug": "gpt-5.5", "context_window": 272000, "max_context_window": 272000}]})

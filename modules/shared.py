@@ -8,18 +8,21 @@ import shlex
 import sys
 import time
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import portable  # noqa: E402
+
 EVENTS = ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "StopFailure",
           "SubagentStart", "SubagentStop", "PreModelSwitch", "PostModelSwitch")
 
 
 def install(api, settings):
-    command = f"{shlex.quote(sys.executable)} {shlex.quote(str(Path.home() / '.local/bin/csw'))} shared-hook"
+    command = f"{shlex.quote(portable.script_path(sys.executable))} {shlex.quote(portable.script_path(portable.CSW_BIN))} shared-hook"
     settings.setdefault("env", {})["CSW_CONFIG_DIR"] = str(api.ROOT)
     for event in EVENTS:
         entries = settings.setdefault("hooks", {}).setdefault(event, [])
         if not any(isinstance(entry, dict) and any(h.get("command") == command for h in entry.get("hooks", [])) for entry in entries):
             entries.append({"hooks": [{"type": "command", "command": command, "timeout": 10}]})
-    inherit = f"{shlex.quote(sys.executable)} {shlex.quote(str(Path.home() / '.local/bin/csw'))} inherit-hook"
+    inherit = f"{shlex.quote(portable.script_path(sys.executable))} {shlex.quote(portable.script_path(portable.CSW_BIN))} inherit-hook"
     entries = settings.setdefault("hooks", {}).setdefault("PreToolUse", [])
     if not any(isinstance(entry, dict) and any(h.get("command") == inherit for h in entry.get("hooks", [])) for entry in entries):
         entries.append({"matcher": "^(Agent|Workflow)$",
@@ -28,14 +31,13 @@ def install(api, settings):
 
 def claude_parent():
     pid = os.getppid()
+    table = portable.process_table() if portable.WINDOWS else None
     for _ in range(12):
         try:
-            directory = Path(f"/proc/{pid}")
-            command = (directory / "cmdline").read_bytes().split(b"\0")[0]
-            if Path(os.fsdecode(command)).name.startswith("claude"):
+            parent, name = portable.process_parent(pid, table)
+            if name.startswith("claude"):
                 return pid
-            fields = (directory / "stat").read_text().rsplit(")", 1)[1].split()
-            pid = int(fields[1])
+            pid = parent
             if pid <= 1:
                 break
         except (OSError, ValueError, IndexError):
@@ -266,7 +268,7 @@ def inherit_tool(api, payload):
             source_path = _workflow_path(api, payload, updated["scriptPath"])
             if source_path.is_symlink() or not source_path.is_file():
                 raise ValueError("scriptPath no es un archivo regular")
-            source = source_path.read_text()
+            source = source_path.read_text(encoding="utf-8")
             inherited = inherit_workflow_effort(source)
             if inherited != source:
                 digest = hashlib.sha256((str(source_path.resolve()) + "\0" + inherited).encode()).hexdigest()[:20]
@@ -280,7 +282,7 @@ def inherit_tool(api, payload):
             name_path = updated["name"] if updated["name"].endswith(".js") else updated["name"] + ".js"
             source_path = _workflow_path(api, payload, name_path)
             if source_path.is_file() and not source_path.is_symlink():
-                source = source_path.read_text()
+                source = source_path.read_text(encoding="utf-8")
                 inherited = inherit_workflow_effort(source)
                 if inherited != source:
                     digest = hashlib.sha256((str(source_path.resolve()) + "\0" + inherited).encode()).hexdigest()[:20]
@@ -325,7 +327,9 @@ def hook(api, payload, environment=None):
         profile = api.resolve(api.active())
         if event in ("UserPromptSubmit", "PreModelSwitch"):
             native = api.provider(settings) == "Claude sub"
-            if native and settings.get("env", {}).get("CLAUDE_CODE_OAUTH_TOKEN") != hot.oauth_access(api, profile):
+            # Only extra Claude accounts pin a token; the primary login renews itself.
+            pinned = settings.get("env", {}).get("CLAUDE_CODE_OAUTH_TOKEN")
+            if native and pinned and pinned != hot.oauth_access(api, profile):
                 raise ValueError(f"Renueva y selecciona la cuenta: csw login {api.profile_label(profile)}")
             for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CSW_PROFILE"):
                 if key == "CLAUDE_CODE_OAUTH_TOKEN" and native and key not in environment:
