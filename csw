@@ -313,7 +313,9 @@ def fetch_model_catalog(path, target):
             data = json.load(response)
         if data.get("has_more"):
             raise ValueError("Catálogo OrcaRouter paginado; no soportado todavía")
-        rows = [{"model": m["id"], "label": m["id"], "context_length": m.get("context_length")}
+        # name is what the OrcaRouter website shows ("OrcaCyber: GLM 5.3 …"); display_name in the Anthropic format.
+        rows = [{"model": m["id"], "label": str(m.get("name") or m.get("display_name") or m["id"]),
+                 "context_length": m.get("context_length")}
                 for m in data.get("data", []) if isinstance(m.get("id"), str)]
         rows.sort(key=lambda row: row["model"] != ORCAROUTER_PROFILE["model"])
         windows = {row["model"]: row["context_length"] for row in rows if isinstance(row.get("context_length"), int)}

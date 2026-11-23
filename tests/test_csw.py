@@ -310,12 +310,16 @@ class ProfilesTest(unittest.TestCase):
         data = csw.read_json(profile)
         listing = io.BytesIO(json.dumps({"data": [
             {"id": "orcarouter/auto"},
-            {"id": "orca/orcacyber-glm-5.3-flash", "context_length": 1048576},
+            {"id": "orca/orcacyber-glm-5.3-flash", "context_length": 1048576,
+             "name": "OrcaCyber: GLM 5.3 Flash Abliterated / Uncensored"},
             {"id": "grok/grok-4.5", "context_length": 500000},
             {"id": "orcarouter/pod"}], "has_more": False}).encode())
         with patch.object(csw.urllib.request, "urlopen", return_value=listing) as fetch:
-            csw.model_catalog(profile, data)
+            catalog = csw.model_catalog(profile, data)
         self.assertNotIn("Anthropic-version", fetch.call_args[0][0].headers)
+        labels = {row["model"]: row["label"] for row in catalog["models"]}
+        self.assertEqual(labels["orca/orcacyber-glm-5.3-flash"], "OrcaCyber: GLM 5.3 Flash Abliterated / Uncensored")
+        self.assertEqual(labels["orcarouter/pod"], "orcarouter/pod")  # no name: the id
         self.assertEqual(csw.documented_context("orca/orcacyber-glm-5.3-flash", data), 1048576)
         self.assertIsNone(csw.documented_context("orcarouter/pod", data))
         self.assertEqual(csw.preferred_context_model("orca/orcacyber-glm-5.3-flash", data),
