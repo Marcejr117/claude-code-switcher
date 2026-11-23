@@ -70,9 +70,39 @@ class ProfilesTest(unittest.TestCase):
         self.assertEqual(data["hooks"]["SessionStart"][0], "new-hook")
         self.assertEqual(data["env"]["SHARED_PATH"], "/new/path")
         self.assertEqual(data["env"]["ANTHROPIC_AUTH_TOKEN"], "")
-        self.assertEqual(data["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "synthetic-native-access")
+        # The primary login is Claude Code's own: no pinned token or endpoint.
+        self.assertEqual(data["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "")
+        self.assertEqual(data["env"]["ANTHROPIC_BASE_URL"], "")
         self.assertEqual(data["model"], "opus[1m]")
         self.assertEqual(csw.active(), csw.ALIASES["claude"])
+
+    def test_republishing_primary_claude_drops_a_previously_pinned_token(self):
+        csw.switch("claude")
+        live = csw.read_json(csw.LIVE)
+        live["env"].update(CLAUDE_CODE_OAUTH_TOKEN="old-pinned", CLAUDE_CODE_OAUTH_SCOPES="user:inference",
+                           ANTHROPIC_BASE_URL="https://api.anthropic.com")
+        csw.write_json(csw.LIVE, live)
+        csw.switch("claude")
+        env = csw.read_json(csw.LIVE)["env"]
+        self.assertEqual((env["CLAUDE_CODE_OAUTH_TOKEN"], env["CLAUDE_CODE_OAUTH_SCOPES"], env["ANTHROPIC_BASE_URL"]),
+                         ("", "", ""))
+
+    def test_native_switch_declares_oauth_scopes_and_other_providers_clear_them(self):
+        # A pinned token (extra Claude account) needs its scopes declared, or Claude
+        # assumes user:inference and disables Claude in Chrome.
+        csw.write_json(csw.ROOT / "settings.json.CLAUDE.work.bak", self.native)
+        (csw.ROOT / "accounts/claude/work").mkdir(parents=True)
+        csw.write_json(csw.ROOT / "accounts/claude/work/.credentials.json", {"claudeAiOauth": {
+            "accessToken": "work-access", "expiresAt": (csw.time.time() + 3600) * 1000,
+            "scopes": ["user:inference", "user:profile"]}})
+        csw.switch("claude:work")
+        self.assertEqual(csw.read_json(csw.LIVE)["env"]["CLAUDE_CODE_OAUTH_SCOPES"], "user:inference user:profile")
+        csw.switch("claude")  # the primary login pins nothing, so it declares nothing
+        self.assertEqual(csw.read_json(csw.LIVE)["env"]["CLAUDE_CODE_OAUTH_SCOPES"], "")
+        csw.switch("claude:work")
+        self.assertEqual(csw.launch_overlay(csw.selected_data(csw.resolve("deepseek")), csw.read_json(csw.LIVE))["env"]["CLAUDE_CODE_OAUTH_SCOPES"], "")
+        csw.switch("deepseek")
+        self.assertEqual(csw.read_json(csw.LIVE)["env"]["CLAUDE_CODE_OAUTH_SCOPES"], "")
 
     def test_roundtrip_keeps_edits_and_correct_provider(self):
         csw.switch("claude")
@@ -319,7 +349,7 @@ class ProfilesTest(unittest.TestCase):
         self.assertNotIn("Anthropic-version", fetch.call_args[0][0].headers)
         labels = {row["model"]: row["label"] for row in catalog["models"]}
         self.assertEqual(labels["orca/orcacyber-glm-5.3-flash"], "OrcaCyber: GLM 5.3 Flash Abliterated / Uncensored")
-        self.assertEqual(labels["orcarouter/pod"], "orcarouter/pod")  # no name: the id
+        self.assertEqual(labels["orcarouter/pod"], "orcarouter/pod")  # no display_name: the id
         self.assertEqual(csw.documented_context("orca/orcacyber-glm-5.3-flash", data), 1048576)
         self.assertIsNone(csw.documented_context("orcarouter/pod", data))
         self.assertEqual(csw.preferred_context_model("orca/orcacyber-glm-5.3-flash", data),

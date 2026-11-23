@@ -76,7 +76,8 @@ PROVIDER_ENV = {
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK",
     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+    "CLAUDE_CODE_OAUTH_SCOPES", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
 }
 PROVIDER_FIELDS = ("model", "effortLevel", "apiKeyHelper", "forceLoginMethod", "forceLoginOrgUUID")
@@ -827,7 +828,22 @@ def restore_account(identifier):
 
 def reloadable_settings(current, target, path):
     """Publish the route in user settings, without pinning the in-session model."""
-    target = hot_module().credentials(types.SimpleNamespace(**globals()), path, target)
+    # The primary Claude login lives in ROOT itself: Claude Code (CLI, IDE extension,
+    # Claude in Chrome) uses and refreshes it natively. Pinning its access token here
+    # made it expire within hours, blocked prompts and disabled login-gated features.
+    native_login = provider(target) == "Claude sub" and account_directory(path)[0] is None
+    if native_login:
+        try:
+            store = hot_module().oauth_store(types.SimpleNamespace(**globals()), path)
+        except (OSError, ValueError):
+            store = {}
+        if not (store.get("accessToken") or store.get("refreshToken")):
+            raise ValueError("Falta el login de Claude: ejecuta claude y usa /login")
+        target = provider_transport(target)
+        for key in ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_SCOPES", "ANTHROPIC_BASE_URL"):
+            target.get("env", {}).pop(key, None)  # republishing the active profile starts from live settings
+    else:
+        target = hot_module().credentials(types.SimpleNamespace(**globals()), path, target)
     target["model"] = effective_model(target)
     prefer_supported_context(target)
     configure_model_picker(target, path)
@@ -840,7 +856,7 @@ def reloadable_settings(current, target, path):
         merged["env"][key] = ""
     merged["env"].update({k: v for k, v in target.get("env", {}).items() if provider_key(k)})
     merged["env"].update(ANTHROPIC_MODEL="", CSW_PROFILE=profile_label(path), CSW_PROVIDER=provider(target))
-    if provider(target) == "Claude sub":
+    if provider(target) == "Claude sub" and not native_login:
         merged["env"]["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
     merged["apiKeyHelper"] = target.get("apiKeyHelper", "")
     merged["modelPicker"] = target["modelPicker"]
@@ -1145,7 +1161,8 @@ def run_claude(args):
     target = provider_transport(target)
     if provider(target) == "Claude sub":
         # Isolated native sessions own their canonical login store and renewal.
-        target.setdefault("env", {}).pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        for key in ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_SCOPES"):
+            target.setdefault("env", {}).pop(key, None)
     prefer_supported_context(target)
     if profile is None:
         profile = LIVE
@@ -1296,6 +1313,7 @@ def launch_overlay(target, inherited):
     # Empty credential values mask the previous provider without changing disk.
     keys = {key for key in inherited.get("env", {}) if provider_key(key)}
     keys.update(("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+                 "CLAUDE_CODE_OAUTH_SCOPES",
                  "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"))
     env = {key: "" for key in keys}
     env.update({key: value for key, value in target.get("env", {}).items() if provider_key(key)})
@@ -1386,7 +1404,7 @@ def main(args):
             return 2  # Claude blocking-hook status; no accidental provider request.
     elif args[0] == "inherit-hook":
         try:
-            print(json.dumps(shared_module().inherit_tool(types.SimpleNamespace(**globals()), json.load(sys.stdin))))
+            print(json.dumps(shared_module().inherit_tool(types.SimpleNamespace(**globals()), json.load(sys.stdin.buffer))))
         except Exception as error:
             print(f"csw: no se pudo aplicar la herencia: {error}", file=sys.stderr)
             return 2  # Fail closed: never run a workflow with silently wrong routing.

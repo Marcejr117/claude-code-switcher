@@ -327,7 +327,9 @@ def hook(api, payload, environment=None):
         profile = api.resolve(api.active())
         if event in ("UserPromptSubmit", "PreModelSwitch"):
             native = api.provider(settings) == "Claude sub"
-            if native and settings.get("env", {}).get("CLAUDE_CODE_OAUTH_TOKEN") != hot.oauth_access(api, profile):
+            # Only extra Claude accounts pin a token; the primary login renews itself.
+            pinned = settings.get("env", {}).get("CLAUDE_CODE_OAUTH_TOKEN")
+            if native and pinned and pinned != hot.oauth_access(api, profile):
                 raise ValueError(f"Renueva y selecciona la cuenta: csw login {api.profile_label(profile)}")
             for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CSW_PROFILE"):
                 if key == "CLAUDE_CODE_OAUTH_TOKEN" and native and key not in environment:
