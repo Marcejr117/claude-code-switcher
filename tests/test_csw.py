@@ -144,6 +144,49 @@ class ProfilesTest(unittest.TestCase):
         self.assertEqual(external[-2:], ["-p", "hello"])
         self.assertFalse(any(a.startswith("--mcp-config") for a in call.call_args.args[0]))
 
+    def test_short_names_resolve_when_unique(self):
+        for name in ("CLAUDE.work", "CLAUDE.home", "GLM.work"):
+            csw.write_json(csw.ROOT / f"settings.json.{name}.bak", self.native)
+            csw.set_name(csw.ROOT / f"settings.json.{name}.bak", name)
+        self.assertEqual(csw.resolve("home").name, "settings.json.CLAUDE.home.bak")
+        self.assertEqual(csw.resolve("glm").name, "settings.json.GLM.work.bak")  # no primary glm profile exists
+        with self.assertRaisesRegex(ValueError, "claude:work.*glm:work"):
+            csw.resolve("work")
+        with self.assertRaisesRegex(ValueError, "No existe"):
+            csw.resolve("settings.json.nothing")
+
+    def test_rename_moves_the_login_with_the_account(self):
+        root = csw.ROOT
+        csw.write_json(root / ".credentials.json", {"claudeAiOauth": {"refreshToken": "main-refresh"}})
+        csw.write_json(root / "settings.json.CLAUDE.work.bak", self.native)
+        (root / "accounts/claude/work").mkdir(parents=True)
+        csw.write_json(root / "accounts/claude/work/.credentials.json", {"claudeAiOauth": {"refreshToken": "work-refresh"}})
+        csw.switch("claude")
+        csw.main(["rename", "claude", "first"])  # the selected primary account
+        self.assertEqual((csw.active(), csw.claude_login()), ("settings.json.CLAUDE.first.bak",) * 2)
+        self.assertEqual(csw.read_json(csw.LIVE)["env"]["CSW_PROFILE"], "claude:first")
+        self.assertEqual(csw.names()["settings.json.CLAUDE.first.bak"], "Claude (first)")
+        csw.main(["rename", "claude:work", "job"])  # a stored one
+        csw.switch("claude:job")
+        self.assertEqual(csw.load_json(root / ".credentials.json")["claudeAiOauth"]["refreshToken"], "work-refresh")
+        csw.switch("first")
+        self.assertEqual(csw.load_json(root / ".credentials.json")["claudeAiOauth"]["refreshToken"], "main-refresh")
+        with self.assertRaisesRegex(ValueError, "Ya existe"):
+            csw.rename_account("claude:job", "first")
+        with self.assertRaisesRegex(ValueError, "Codex y Cursor"):
+            csw.rename_account("codex", "other")
+
+    def test_doctor_reports_only_existing_accounts(self):
+        csw.write_json(csw.ROOT / "settings.json.CLAUDE.work.bak", self.native)
+        csw.set_name(csw.ROOT / "settings.json.CLAUDE.work.bak", "Work")
+        with patch.object(csw, "authenticated", return_value=True), patch.object(csw, "proxy_ready", return_value=False), \
+                patch("builtins.print") as output:
+            self.assertEqual(csw.doctor(), 1)
+        lines = [call.args[0] for call in output.call_args_list]
+        self.assertTrue(any(line.startswith("!!") and "csw login claude:work" in line for line in lines))
+        self.assertEqual(sum(line.startswith("ok") for line in lines), 3)  # deepseek, claude, codex
+        self.assertFalse(any("glm" in line or "cursor" in line for line in lines[:-1]))
+
     def test_a_user_defined_chrome_server_is_never_replaced_or_removed(self):
         config = csw.ROOT / ".claude.json"
         csw.write_json(config, {"mcpServers": {"chrome": {"command": "other"}}})
