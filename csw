@@ -73,7 +73,7 @@ PROVIDER_ENV = {
     "CLAUDE_CODE_DISABLE_1M_CONTEXT",
     "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "DISABLE_AUTO_COMPACT",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-    "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK",
+    "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK", "ENABLE_TOOL_SEARCH", "CLAUDE_CODE_AUTO_MODE_SERVER",
     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_SCOPES", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
     "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
@@ -216,6 +216,11 @@ def prefer_supported_context(target, model_override=None):
             env[key] = preferred_context_model(env[key], target)
     selected_model = model_override or effective_model(target)
     window = documented_context(selected_model, target)
+    if backend in ("Codex", "Cursor"):
+        # claude-code-proxy forwards every tool schema but not ToolSearch's tool_reference
+        # results: with deferred tools the model sees names only. It cannot answer the
+        # server-side auto-mode classifier either; without this Claude warns on every start.
+        env.update(ENABLE_TOOL_SEARCH="false", CLAUDE_CODE_AUTO_MODE_SERVER="0")
     if backend == "Codex":
         # Codex models are custom provider IDs. Claude applies MAX_CONTEXT_TOKENS
         # directly to their untagged IDs; DISABLE_1M_CONTEXT instead asks Claude

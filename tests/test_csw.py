@@ -144,6 +144,15 @@ class ProfilesTest(unittest.TestCase):
         self.assertEqual(external[-2:], ["-p", "hello"])
         self.assertFalse(any(a.startswith("--mcp-config") for a in call.call_args.args[0]))
 
+    def test_proxy_providers_load_tool_schemas_upfront_and_claude_clears_it(self):
+        with patch.object(csw, "check_proxy"):
+            csw.switch("codex")
+        env = csw.read_json(csw.LIVE)["env"]
+        self.assertEqual((env["ENABLE_TOOL_SEARCH"], env["CLAUDE_CODE_AUTO_MODE_SERVER"]), ("false", "0"))
+        csw.switch("claude")
+        env = csw.read_json(csw.LIVE)["env"]
+        self.assertEqual((env["ENABLE_TOOL_SEARCH"], env["CLAUDE_CODE_AUTO_MODE_SERVER"]), ("", ""))
+
     def test_short_names_resolve_when_unique(self):
         for name in ("CLAUDE.work", "CLAUDE.home", "GLM.work"):
             csw.write_json(csw.ROOT / f"settings.json.{name}.bak", self.native)
