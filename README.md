@@ -153,6 +153,10 @@ which has the built-in integration. Navigation, page text and screenshots work;
 what the model makes of a screenshot depends on its own image support. The
 Claude extension must be installed in Chrome, same as for Claude itself.
 
+The extension pairs with one claude.ai account: it only connects while Chrome is
+signed in to claude.ai with the same account as the Claude login csw has
+selected, for Claude and for the `chrome` server alike.
+
 ## Subscription proxy (Codex / Cursor, optional)
 
 Codex and Cursor accounts are routed through
