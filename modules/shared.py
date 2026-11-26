@@ -247,6 +247,13 @@ def inherit_tool(api, payload):
     name = payload.get("tool_name")
     if name not in ("Agent", "Workflow"):
         return {}
+    # Native Claude (subscription or api.anthropic.com) knows every model alias and effort level: leave the
+    # agent's own model/effort alone. Only other providers need agents to inherit the live session model.
+    try:
+        if api.provider(api.read_json(api.LIVE)) == "Claude sub":
+            return {}
+    except Exception:
+        pass
     original = payload.get("tool_input")
     if not isinstance(original, dict):
         raise ValueError("entrada de Agent/Workflow no reconocida")

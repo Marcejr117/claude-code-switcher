@@ -87,22 +87,69 @@ class ProfilesTest(unittest.TestCase):
         self.assertEqual((env["CLAUDE_CODE_OAUTH_TOKEN"], env["CLAUDE_CODE_OAUTH_SCOPES"], env["ANTHROPIC_BASE_URL"]),
                          ("", "", ""))
 
-    def test_native_switch_declares_oauth_scopes_and_other_providers_clear_them(self):
-        # A pinned token (extra Claude account) needs its scopes declared, or Claude
-        # assumes user:inference and disables Claude in Chrome.
-        csw.write_json(csw.ROOT / "settings.json.CLAUDE.work.bak", self.native)
-        (csw.ROOT / "accounts/claude/work").mkdir(parents=True)
-        csw.write_json(csw.ROOT / "accounts/claude/work/.credentials.json", {"claudeAiOauth": {
-            "accessToken": "work-access", "expiresAt": (csw.time.time() + 3600) * 1000,
-            "scopes": ["user:inference", "user:profile"]}})
+    def test_claude_account_switch_swaps_the_native_login_and_pins_nothing(self):
+        # Every Claude account becomes the login Claude Code itself uses and renews:
+        # a token pinned in settings.json expired and turned Claude in Chrome off.
+        root = csw.ROOT
+        csw.write_json(root / ".credentials.json", {"mcpOAuth": {"keep": 1}, "claudeAiOauth": {
+            "accessToken": "main-access", "refreshToken": "main-refresh"}})
+        csw.write_json(root / ".claude.json", {"userID": "keep", "oauthAccount": {"emailAddress": "main@example.invalid"}})
+        csw.write_json(root / "settings.json.CLAUDE.work.bak", self.native)
+        (root / "accounts/claude/work").mkdir(parents=True)
+        csw.write_json(root / "accounts/claude/work/.credentials.json", {"claudeAiOauth": {
+            "accessToken": "work-access", "refreshToken": "work-refresh"}})
+        csw.write_json(root / "accounts/claude/work/.claude.json", {"oauthAccount": {"emailAddress": "work@example.invalid"}})
+
         csw.switch("claude:work")
-        self.assertEqual(csw.read_json(csw.LIVE)["env"]["CLAUDE_CODE_OAUTH_SCOPES"], "user:inference user:profile")
-        csw.switch("claude")  # the primary login pins nothing, so it declares nothing
-        self.assertEqual(csw.read_json(csw.LIVE)["env"]["CLAUDE_CODE_OAUTH_SCOPES"], "")
-        csw.switch("claude:work")
-        self.assertEqual(csw.launch_overlay(csw.selected_data(csw.resolve("deepseek")), csw.read_json(csw.LIVE))["env"]["CLAUDE_CODE_OAUTH_SCOPES"], "")
+        self.assertEqual(csw.load_json(root / ".credentials.json"), {"mcpOAuth": {"keep": 1}, "claudeAiOauth": {
+            "accessToken": "work-access", "refreshToken": "work-refresh"}})
+        self.assertEqual(csw.load_json(root / ".claude.json"),
+                         {"userID": "keep", "oauthAccount": {"emailAddress": "work@example.invalid"}})
+        env = csw.read_json(csw.LIVE)["env"]
+        self.assertEqual((env["CLAUDE_CODE_OAUTH_TOKEN"], env["CLAUDE_CODE_OAUTH_SCOPES"], env["ANTHROPIC_BASE_URL"]), ("", "", ""))
+        self.assertEqual(csw.native_environment(csw.resolve("claude:work"))["CLAUDE_CONFIG_DIR"], str(root))  # login and run use ROOT now
+
+        # Claude renewed the work login while it was selected; another provider in between changes nothing.
+        csw.write_json(root / ".credentials.json", {"claudeAiOauth": {"accessToken": "work-renewed", "refreshToken": "work-refresh-2"}})
         csw.switch("deepseek")
-        self.assertEqual(csw.read_json(csw.LIVE)["env"]["CLAUDE_CODE_OAUTH_SCOPES"], "")
+        self.assertEqual(csw.claude_login(), "settings.json.CLAUDE.work.bak")
+        csw.switch("claude")
+        self.assertEqual(csw.load_json(root / ".credentials.json")["claudeAiOauth"]["refreshToken"], "main-refresh")
+        self.assertEqual(csw.load_json(root / ".claude.json")["oauthAccount"]["emailAddress"], "main@example.invalid")
+        self.assertEqual(csw.load_json(root / "accounts/claude/work/.credentials.json")["claudeAiOauth"]["refreshToken"], "work-refresh-2")
+        self.assertTrue(Path(csw.native_environment(csw.resolve("claude:work"))["CLAUDE_CONFIG_DIR"]).as_posix().endswith("accounts/claude/work"))
+
+    def test_claude_account_without_login_changes_nothing(self):
+        csw.write_json(csw.ROOT / "settings.json.CLAUDE.work.bak", self.native)
+        before = (csw.LIVE.read_bytes(), (csw.ROOT / ".credentials.json").read_bytes())
+        with self.assertRaisesRegex(ValueError, "csw login claude:work"):
+            csw.switch("claude:work")
+        self.assertEqual(before, (csw.LIVE.read_bytes(), (csw.ROOT / ".credentials.json").read_bytes()))
+        self.assertEqual(csw.active(), csw.ALIASES["deepseek"])
+
+    def test_other_providers_get_the_chrome_extension_as_mcp_server(self):
+        config = csw.ROOT / ".claude.json"
+        csw.write_json(config, {"mcpServers": {"mine": {"command": "x"}}})
+        csw.switch("deepseek")
+        servers = csw.load_json(config)["mcpServers"]
+        self.assertEqual(servers["chrome"]["args"], ["--claude-in-chrome-mcp"])
+        csw.switch("claude")  # native Claude has its own integration: no duplicate tools
+        self.assertEqual(csw.load_json(config)["mcpServers"], {"mine": {"command": "x"}})
+        with patch.object(csw, "run_child", return_value=0) as call:
+            csw.run_claude(["deepseek", "--", "-p", "hello"])
+            external = call.call_args.args[0]
+            csw.run_claude(["claude", "--", "-p", "hello"])
+        self.assertEqual(json.loads(next(a for a in external if a.startswith("--mcp-config=")).split("=", 1)[1]),
+                         {"mcpServers": {"chrome": csw.chrome_server()}})
+        self.assertEqual(external[-2:], ["-p", "hello"])
+        self.assertFalse(any(a.startswith("--mcp-config") for a in call.call_args.args[0]))
+
+    def test_a_user_defined_chrome_server_is_never_replaced_or_removed(self):
+        config = csw.ROOT / ".claude.json"
+        csw.write_json(config, {"mcpServers": {"chrome": {"command": "other"}}})
+        csw.switch("deepseek")
+        csw.switch("claude")
+        self.assertEqual(csw.load_json(config)["mcpServers"], {"chrome": {"command": "other"}})
 
     def test_roundtrip_keeps_edits_and_correct_provider(self):
         csw.switch("claude")
@@ -394,12 +441,12 @@ class ProfilesTest(unittest.TestCase):
     def test_run_selected_native_account_and_literal_prompt(self):
         with patch.object(csw, "login", return_value=0):
             csw.add_account("claude", "max2")
-        csw.write_json(csw.ROOT / "accounts/claude/max2/.credentials.json", csw.read_json(csw.ROOT / ".credentials.json"))
+        csw.write_json(csw.ROOT / "accounts/claude/max2/.credentials.json", {"claudeAiOauth": {"refreshToken": "max2-refresh"}})
         csw.switch("claude:max2")
         with patch.object(csw, "run_child", return_value=0) as call:
             csw.run_claude(["--", "hello world"])
         self.assertEqual(call.call_args.args[0][-1], "hello world")
-        self.assertTrue(Path(call.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"]).as_posix().endswith("accounts/claude/max2"))
+        self.assertEqual(call.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"], str(csw.ROOT))  # the selected account's login is ROOT's
 
     def test_run_default_model_choice_stays_out_of_shared_settings(self):
         csw.switch("claude")

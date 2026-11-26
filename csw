@@ -46,8 +46,7 @@ GLM_PROFILE = {"env": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic", "
 DEEPSEEK_PROFILE = {"env": {"ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic", "ANTHROPIC_MODEL": "deepseek-v4-pro",
                             "CLAUDE_CODE_SUBAGENT_MODEL": "inherit", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"},
                     "model": "deepseek-v4-pro"}
-CLAUDE_PROFILE = {"env": {"CLAUDE_CODE_SUBAGENT_MODEL": "inherit", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"},
-                  "model": "default"}
+CLAUDE_PROFILE = {"env": {}, "model": "default"}  # native Claude: agents keep their own model/effort
 CODEX_PROFILE = {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:18765", "ANTHROPIC_AUTH_TOKEN": "unused",
                          "ANTHROPIC_MODEL": "gpt-5.6-sol",
                          "CLAUDE_CODE_SUBAGENT_MODEL": "inherit", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"},
@@ -81,6 +80,10 @@ PROVIDER_ENV = {
     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
 }
 PROVIDER_FIELDS = ("model", "effortLevel", "apiKeyHelper", "forceLoginMethod", "forceLoginOrgUUID")
+LOCAL_COMMANDS = ("mcp", "plugin", "plugins", "doctor", "update", "upgrade", "install", "agents", "auth",
+                  "attach", "logs", "respawn", "rm", "stop", "kill", "project", "gateway", "import",
+                  "auto-mode", "setup-token", "ultrareview")
+CHROME_MCP = "chrome"  # Claude Code reserves "claude-in-chrome" and ignores a configured server of that name
 SHARED_RESOURCES = ("CLAUDE.md", "AGENTS.md", "agents", "skills", "commands", "workflows", "rules",
                     "hooks", "plugins", "output-styles", "themes", "keybindings.json")
 
@@ -699,6 +702,113 @@ def account_directory(path):
     return CONFIG_ROOT / "accounts" / f"{backend}-{slug}", f"claude-code-proxy@{backend}-{slug}.service"
 
 
+def global_config():
+    # Claude keeps .claude.json beside its default directory, but inside a custom CLAUDE_CONFIG_DIR.
+    return ROOT.parent / ".claude.json" if ROOT == Path.home() / ".claude" else ROOT / ".claude.json"
+
+
+def load_json(path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def update_global_config(change):
+    """Edit Claude's own .claude.json; an unreadable file is left alone, never rebuilt."""
+    path = global_config()
+    data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Configuración inválida: {path.name}")
+    before = copy.deepcopy(data)
+    change(data)
+    if data != before:
+        write_json(path, data)
+
+
+def claude_login():
+    """Profile whose Claude login sits in ROOT, the store Claude Code itself uses and renews."""
+    marker = ROOT / ".claude-login"
+    name = marker.read_text(encoding="utf-8").strip() if marker.is_file() else ""
+    return name if name and (ROOT / name).is_file() else ALIASES["claude"]
+
+
+def claude_stash(path):
+    return account_directory(path)[0] or ROOT / "accounts/claude/_primary"
+
+
+def claude_store(path):
+    """Where a Claude profile's login lives: ROOT while it is the selected one, its own directory otherwise."""
+    if path.name == claude_login() or not path.name.startswith("settings.json.CLAUDE."):
+        return ROOT
+    return claude_stash(path)
+
+
+def select_claude_login(path):
+    """Make a Claude account the native login.
+
+    Its tokens and account metadata move into ROOT, so Claude Code, the IDE extension,
+    Claude in Chrome and the claude.ai connectors use and renew them as after /login.
+    Pinning an access token in settings.json instead expired within hours and turned
+    login-gated features off. The outgoing account keeps its (renewed) login in its
+    own directory for the next switch.
+    """
+    if path.name == claude_login():
+        return
+    source = claude_stash(path)
+    incoming = load_json(source / ".credentials.json").get("claudeAiOauth")
+    if not isinstance(incoming, dict) or not incoming.get("refreshToken"):
+        raise ValueError(f"Falta el login de esa cuenta: csw login {profile_label(path)}")
+    # A csw run session of this account renews the stored copy; taking it now would fork the login.
+    with account_lock(path, exclusive=True):
+        live_path = ROOT / ".credentials.json"
+        live = load_json(live_path)
+        stash = claude_stash(ROOT / claude_login())
+        account = load_json(source / ".claude.json").get("oauthAccount")
+
+        def swap(config):
+            if live.get("claudeAiOauth"):
+                stash.mkdir(mode=0o700, parents=True, exist_ok=True)
+                write_json(stash / ".credentials.json",
+                           {**load_json(stash / ".credentials.json"), "claudeAiOauth": live["claudeAiOauth"]})
+                if config.get("oauthAccount"):
+                    write_json(stash / ".claude.json",
+                               {**load_json(stash / ".claude.json"), "oauthAccount": config["oauthAccount"]})
+            # Without metadata Claude fetches the profile again on its next start.
+            config.pop("oauthAccount", None)
+            if account:
+                config["oauthAccount"] = account
+
+        update_global_config(swap)
+        write_json(live_path, {**live, "claudeAiOauth": incoming})
+        atomic_write(ROOT / ".claude-login", path.name + "\n")
+
+
+def chrome_server():
+    return {"command": shutil.which(CLAUDE_BIN) or CLAUDE_BIN, "args": ["--claude-in-chrome-mcp"]}
+
+
+def publish_chrome(external):
+    """Give other providers the browser too.
+
+    Claude Code enables Claude in Chrome only with a claude.ai login, but the bridge to
+    the extension works as a plain MCP server: navigation, page reading and screenshots
+    (vision, when the model accepts images). Native Claude keeps its built-in integration.
+    """
+    def change(config):
+        servers = config.get("mcpServers")
+        servers = servers if isinstance(servers, dict) else {}
+        ours = isinstance(servers.get(CHROME_MCP), dict) and servers[CHROME_MCP].get("args") == ["--claude-in-chrome-mcp"]
+        if external and (ours or CHROME_MCP not in servers):
+            servers[CHROME_MCP] = chrome_server()
+            config["mcpServers"] = servers
+        elif not external and ours:
+            del servers[CHROME_MCP]
+
+    update_global_config(change)
+
+
 def legacy_session_running(path, target):
     directory, _ = account_directory(path)
     url = target.get("env", {}).get("ANTHROPIC_BASE_URL", "")
@@ -734,6 +844,8 @@ def remove_account(value):
             raise ValueError("Esta cuenta está seleccionada en una sesión csw hot; cambia esa sesión antes de retirarla")
         if path.name == active():
             raise ValueError("Es el perfil seleccionado. Selecciona otro con csw antes de retirarlo")
+        if path.name == claude_login() and account_directory(path)[0] is not None:
+            raise ValueError("Su login es el de Claude ahora mismo. Selecciona otra cuenta Claude antes de retirarla")
         target = read_json(path)
         if legacy_session_running(path, target):
             raise ValueError("Hay una sesión de Claude usando esta conexión; ciérrala antes de retirarla")
@@ -828,11 +940,11 @@ def restore_account(identifier):
 
 def reloadable_settings(current, target, path):
     """Publish the route in user settings, without pinning the in-session model."""
-    # The primary Claude login lives in ROOT itself: Claude Code (CLI, IDE extension,
-    # Claude in Chrome) uses and refreshes it natively. Pinning its access token here
-    # made it expire within hours, blocked prompts and disabled login-gated features.
-    native_login = provider(target) == "Claude sub" and account_directory(path)[0] is None
-    if native_login:
+    # The selected Claude login lives in ROOT itself (select_claude_login): Claude Code
+    # (CLI, IDE extension, Claude in Chrome) uses and refreshes it natively. Pinning an
+    # access token here made it expire within hours, blocked prompts and disabled
+    # login-gated features.
+    if provider(target) == "Claude sub":
         try:
             store = hot_module().oauth_store(types.SimpleNamespace(**globals()), path)
         except (OSError, ValueError):
@@ -843,7 +955,7 @@ def reloadable_settings(current, target, path):
         for key in ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_SCOPES", "ANTHROPIC_BASE_URL"):
             target.get("env", {}).pop(key, None)  # republishing the active profile starts from live settings
     else:
-        target = hot_module().credentials(types.SimpleNamespace(**globals()), path, target)
+        target = provider_transport(target)
     target["model"] = effective_model(target)
     prefer_supported_context(target)
     configure_model_picker(target, path)
@@ -856,8 +968,6 @@ def reloadable_settings(current, target, path):
         merged["env"][key] = ""
     merged["env"].update({k: v for k, v in target.get("env", {}).items() if provider_key(k)})
     merged["env"].update(ANTHROPIC_MODEL="", CSW_PROFILE=profile_label(path), CSW_PROVIDER=provider(target))
-    if provider(target) == "Claude sub" and not native_login:
-        merged["env"]["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
     merged["apiKeyHelper"] = target.get("apiKeyHelper", "")
     merged["modelPicker"] = target["modelPicker"]
     shared_module().install(types.SimpleNamespace(**globals()), merged)
@@ -871,6 +981,8 @@ def switch(value):
         same = path.name == active()
         target = copy.deepcopy(current) if same else read_json(path)
         check_proxy(target)
+        if provider(target) == "Claude sub":
+            select_claude_login(path)
         merged = reloadable_settings(current, target, path)
         previous = profile_path(active()) if active() else ROOT / "settings.json.autosave"
         for destination in (LIVE, ACTIVE, previous):
@@ -882,11 +994,14 @@ def switch(value):
             write_json(LIVE, merged)
         if not same:
             atomic_write(ACTIVE, path.name + "\n")
+        publish_chrome(provider(merged) != "Claude sub")
     print(f"settings.json → {names().get(path.name, profile_label(path))} ({provider(merged)})")
     print("No se ha abierto ni reiniciado Claude. El cambio se publica aunque haya turnos, subagentes o goals activos.")
     print("Una petición ya enviada termina con la cuenta anterior; las nuevas usarán la elegida cuando Claude recargue settings.json.")
     print("Espera un par de segundos. Si el modelo actual no pertenece a la cuenta nueva, usa /model antes del siguiente mensaje.")
     print("Las sesiones antiguas con --settings/csw run, y las sesiones hot aisladas, conservan su conexión.")
+    if provider(merged) != "Claude sub":
+        print(f"Navegador: la extensión de Claude queda disponible como servidor MCP «{CHROME_MCP}» en las sesiones nuevas.")
     if provider(merged) == "Cursor":
         print("Cursor: texto comprobado; su adaptador no admite todavía las herramientas nativas. Esas llamadas devuelven un error explícito.")
 
@@ -979,7 +1094,7 @@ def native_environment(profile):
     if ROOT != Path.home() / ".claude":
         environment["CLAUDE_CONFIG_DIR"] = str(ROOT)
     account = re.fullmatch(r"settings\.json\.CLAUDE\.([a-z0-9_-]+)\.bak", profile.name)
-    if account:
+    if account and profile.name != claude_login():  # the selected account's login is ROOT's
         directory = ROOT / "accounts" / "claude" / account[1]
         if not directory.is_dir():
             raise ValueError("No existe el directorio de sesión de esa cuenta Claude")
@@ -1122,10 +1237,7 @@ def launch_claude(args):
     for key in ("CSW_HOT_ID", "CSW_HOT_REVISION"):
         environment.pop(key, None)
     environment.pop("CSW_SHARED_DISABLED", None)
-    local = bool(forwarded and forwarded[0] in (
-        "mcp", "plugin", "plugins", "doctor", "update", "upgrade", "install", "agents", "auth",
-        "attach", "logs", "respawn", "rm", "stop", "kill", "project", "gateway", "import",
-        "auto-mode", "setup-token", "ultrareview"))
+    local = bool(forwarded and forwarded[0] in LOCAL_COMMANDS)
     if not local and not any(arg in ("--version", "-v", "--help", "-h") for arg in forwarded):
         target = read_json(LIVE)
         model = effective_model(target)
@@ -1207,6 +1319,9 @@ def run_claude(args):
             # User scope owns MCP servers, skills and agents. Keep it enabled and
             # override only the provider, so hooks and permission lists load once.
             guard, moved = shared_model_guard(profile, target)
+            if provider(target) != "Claude sub" and not (forwarded and forwarded[0] in LOCAL_COMMANDS):
+                # Before the user's arguments: --mcp-config takes several values and would swallow a prompt.
+                forwarded = [f"--mcp-config={json.dumps({'mcpServers': {CHROME_MCP: chrome_server()}})}", *forwarded]
             result = run_child([CLAUDE_BIN, "--setting-sources", "user,project,local", "--settings", str(snapshot), *forwarded],
                                env=environment, tick=guard)
             if moved:

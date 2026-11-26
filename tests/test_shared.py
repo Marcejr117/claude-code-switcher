@@ -44,7 +44,7 @@ class SharedTest(unittest.TestCase):
         self.assertNotIn("CSW_SHARED_DISABLED", env)
         self.assertNotIn("CSW_HOT_ID", env)
 
-    def test_claude_accounts_use_separate_canonical_access_not_refresh_tokens(self):
+    def test_claude_accounts_never_put_tokens_in_settings(self):
         profile = csw.ROOT / "settings.json.CLAUDE.work.bak"
         csw.write_json(profile, self.native)
         directory = csw.ROOT / "accounts/claude/work"
@@ -52,10 +52,9 @@ class SharedTest(unittest.TestCase):
         creds = {"claudeAiOauth": {"accessToken": "work-access", "refreshToken": "never-copy", "expiresAt": (csw.time.time() + 3600) * 1000}}
         csw.write_json(directory / ".credentials.json", creds)
         csw.switch("claude:work")
-        self.assertEqual(csw.read_json(csw.LIVE)["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "work-access")
-        self.assertNotIn("never-copy", csw.LIVE.read_text())
-        csw.switch("claude")
         self.assertEqual(csw.read_json(csw.LIVE)["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "")
+        self.assertNotIn("work-access", csw.LIVE.read_text())
+        self.assertNotIn("never-copy", csw.LIVE.read_text())
 
     def test_native_management_commands_do_not_receive_model_flags(self):
         for arguments in (["--help"], ["--version"], ["mcp", "list"], ["logs", "example"], ["agents", "list"]):

@@ -378,9 +378,7 @@ def choose_session(api, identifier=None):
 
 
 def oauth_store(api, profile):
-    directory, _ = api.account_directory(profile)
-    directory = directory if directory is not None else api.ROOT
-    return api.read_json(directory / ".credentials.json").get("claudeAiOauth", {})
+    return api.read_json(api.claude_store(profile) / ".credentials.json").get("claudeAiOauth", {})
 
 
 def oauth_scopes(api, profile):

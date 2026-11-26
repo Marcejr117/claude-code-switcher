@@ -133,6 +133,26 @@ csw active                # what the live settings point at
 Inside Claude Code, `/model` shows the profile's own picker, built from the
 provider catalog with context windows included.
 
+## Several Claude accounts
+
+`csw add claude <name>` logs the account in once, in the browser. From then on
+`csw claude:<name>` (or its number) makes it *the* Claude Code login: its tokens
+and account metadata are swapped into `~/.claude/.credentials.json` and
+`.claude.json`, and the previous account's renewed login is put back in its own
+directory. Nothing is pinned in `settings.json`, so Claude Code keeps renewing
+the login itself and everything that needs a real claude.ai login keeps working:
+the IDE extension, Claude in Chrome, claude.ai connectors. No second `/login`.
+
+## The browser with other providers
+
+Claude Code only turns Claude in Chrome on with a claude.ai login, so it is off
+under GLM, DeepSeek, Codex and the rest. The bridge to the extension still works
+as a plain MCP server, so csw registers it as `chrome` (tools `mcp__chrome__*`)
+whenever the selected provider is not Claude, and removes it again for Claude,
+which has the built-in integration. Navigation, page text and screenshots work;
+what the model makes of a screenshot depends on its own image support. The
+Claude extension must be installed in Chrome, same as for Claude itself.
+
 ## Subscription proxy (Codex / Cursor, optional)
 
 Codex and Cursor accounts are routed through
