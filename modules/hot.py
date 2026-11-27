@@ -277,6 +277,15 @@ def _clear_finished_agents(state):
                 latest[agent] = (status, receipt.timestamp())
     except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
         return False
+    # An agent started by another agent reports to its parent, never to this transcript.
+    # Claude marks every finished agent in its subagents/<id>.meta.json.
+    for agent in pending - latest.keys():
+        meta = Path(filename[:-len(".jsonl")]) / "subagents" / f"agent-{agent}.meta.json"
+        try:
+            if json.loads(meta.read_text(encoding="utf-8")).get("finished") is True:
+                latest[agent] = ("completed", meta.stat().st_mtime)
+        except (OSError, ValueError, AttributeError):
+            continue
     for agent, (status, ended) in _workflow_agent_states(state, pending).items():
         if (status not in ("completed", "failed") or agent not in latest
                 or ended is not None and ended >= latest[agent][1]):

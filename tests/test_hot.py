@@ -236,6 +236,21 @@ class HotTest(unittest.TestCase):
         self.assertEqual(self.read_state()["agents"], [])
         self.assertNotIn("agents_started", self.read_state())
 
+    def test_finished_nested_subagent_releases_model_switch(self):
+        # A grandchild agent's notification goes to its parent agent; only its meta file says it ended.
+        transcript = self.directory / "nested.jsonl"
+        csw.atomic_write(transcript, json.dumps({"type": "queue-operation", "content": "<task-id>grandchild</task-id>"}) + "\n")
+        self.call("SessionStart", session_id="test-session", transcript_path=str(transcript))
+        self.call("SubagentStart", agent_id="grandchild")
+        meta = self.directory / "nested" / "subagents" / "agent-grandchild.meta.json"
+        meta.parent.mkdir(parents=True)
+        csw.write_json(meta, {"finished": False})
+        with self.assertRaisesRegex(ValueError, "subagentes"):
+            self.call("PreModelSwitch", to_model="deepseek-flash")
+        csw.write_json(meta, {"finished": True})
+        self.assertEqual(self.call("PreModelSwitch", to_model="deepseek-flash"), {})
+        self.assertEqual(self.read_state()["agents"], [])
+
     def test_project_overrides_and_reload_races_block_requests(self):
         env = self.environment()
         for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "CSW_HOT_REVISION"):
