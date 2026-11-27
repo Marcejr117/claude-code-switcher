@@ -6,7 +6,7 @@ Claude access tokens are read from their owning account, never refresh tokens.
 """
 import contextlib
 import copy
-from datetime import datetime
+from datetime import datetime, timezone
 import importlib.machinery
 import importlib.util
 import json
@@ -307,7 +307,35 @@ def _clear_finished_agents(state):
     return True
 
 
+def _clear_idle_job(state):
+    """Background sessions publish their own state: idle with nothing in flight is authoritative.
+
+    A turn whose request fails at once can end without Stop or StopFailure, which left the
+    session marked busy and /model blocked for good.
+    """
+    filename = state.get("transcript_path")
+    if not (state.get("busy") or state.get("agents")) or not isinstance(filename, str) or not filename.endswith(".jsonl"):
+        return False
+    transcript = Path(filename)
+    try:
+        jobs = transcript.parents[2] / "jobs"  # named by the short id (daemonShort)
+        job = json.loads(next(p for p in (jobs / transcript.stem[:8] / "state.json", jobs / transcript.stem / "state.json")
+                              if p.is_file()).read_text(encoding="utf-8"))
+        flight = job.get("inFlight") or {}
+        updated = datetime.fromisoformat(job["updatedAt"].replace("Z", "+00:00")).timestamp()
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, StopIteration):
+        return False
+    started = max([state.get("busy_since") or 0, *(state.get("agents_started") or {}).values()])
+    if job.get("tempo") != "idle" or flight.get("tasks") != 0 or flight.get("queued") != 0 or updated < started:
+        return False
+    state.update(busy=False, agents=[])
+    state.pop("busy_since", None)
+    state.pop("agents_started", None)
+    return True
+
+
 def ensure_model_switch_idle(state):
+    _clear_idle_job(state)
     _clear_interrupted_turn(state)
     if not state.get("busy"):
         _clear_finished_agents(state)

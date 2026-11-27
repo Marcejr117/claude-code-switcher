@@ -236,6 +236,26 @@ class HotTest(unittest.TestCase):
         self.assertEqual(self.read_state()["agents"], [])
         self.assertNotIn("agents_started", self.read_state())
 
+    def test_idle_background_job_releases_a_turn_that_never_reported_stop(self):
+        root = self.directory / "claude"
+        transcript = root / "projects" / "proj" / "0c239207-full-session-id.jsonl"
+        transcript.parent.mkdir(parents=True)
+        csw.atomic_write(transcript, "")
+        job = root / "jobs" / "0c239207" / "state.json"
+        job.parent.mkdir(parents=True)
+        state = {"busy": True, "busy_since": 100.0, "agents": [], "transcript_path": str(transcript)}
+
+        def write(tempo, tasks, when):
+            csw.write_json(job, {"tempo": tempo, "inFlight": {"tasks": tasks, "queued": 0},
+                                 "updatedAt": hot.datetime.fromtimestamp(when, hot.timezone.utc).isoformat()})
+        for tempo, tasks, when in (("busy", 0, 200), ("idle", 1, 200), ("idle", 0, 50)):
+            write(tempo, tasks, when)
+            with self.subTest(tempo=tempo, tasks=tasks, when=when), self.assertRaisesRegex(ValueError, "trabajando"):
+                hot.ensure_model_switch_idle(dict(state))
+        write("idle", 0, 200)
+        hot.ensure_model_switch_idle(state)
+        self.assertFalse(state["busy"])
+
     def test_finished_nested_subagent_releases_model_switch(self):
         # A grandchild agent's notification goes to its parent agent; only its meta file says it ended.
         transcript = self.directory / "nested.jsonl"
