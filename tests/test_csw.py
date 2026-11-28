@@ -488,7 +488,19 @@ class ProfilesTest(unittest.TestCase):
         with patch.object(csw, "run_child", side_effect=launch):
             self.assertEqual(csw.run_claude(["claude:max2", "--", "-p", "test"]), 0)
         self.assertEqual(before, csw.LIVE.read_bytes())
-        self.assertFalse(seen["snapshot"].exists())
+        self.assertTrue(seen["snapshot"].exists())  # background sessions relaunch with it
+
+    def test_old_run_snapshots_are_pruned_unless_a_background_session_uses_them(self):
+        directory = csw.ROOT / "run-settings"
+        directory.mkdir()
+        for name in ("session-old.json", "session-used.json", "session-new.json"):
+            csw.write_json(directory / name, {"env": {}})
+        for name in ("session-old.json", "session-used.json"):
+            os.utime(directory / name, (0, 0))
+        (csw.ROOT / "jobs/abc").mkdir(parents=True)
+        csw.write_json(csw.ROOT / "jobs/abc/state.json", {"respawnFlags": ["--settings", str(directory / "session-used.json")]})
+        csw.prune_run_settings(directory)
+        self.assertEqual(sorted(p.name for p in directory.iterdir()), ["session-new.json", "session-used.json"])
 
     def test_run_selected_native_account_and_literal_prompt(self):
         with patch.object(csw, "login", return_value=0):

@@ -1350,28 +1350,43 @@ def run_claude(args):
         environment["CSW_PROVIDER"] = provider(target)
         directory = ROOT / "run-settings"
         directory.mkdir(mode=0o700, exist_ok=True)
+        prune_run_settings(directory)
         fd, filename = tempfile.mkstemp(prefix="session-", suffix=".json", dir=directory)
         os.close(fd)
+        # Kept after Claude exits: background sessions created from this one are
+        # relaunched with the same --settings path and hang at "opening" without it.
         snapshot = Path(filename)
+        overlay = launch_overlay(target, current)
+        overlay.update({key: value for key, value in extra_settings.items() if key != "env"})
+        overlay["env"].update(extra_settings.get("env", {}))
+        write_json(snapshot, overlay)
+        # User scope owns MCP servers, skills and agents. Keep it enabled and
+        # override only the provider, so hooks and permission lists load once.
+        guard, moved = shared_model_guard(profile, target)
+        if provider(target) != "Claude sub" and not (forwarded and forwarded[0] in LOCAL_COMMANDS):
+            # Before the user's arguments: --mcp-config takes several values and would swallow a prompt.
+            forwarded = [f"--mcp-config={json.dumps({'mcpServers': {CHROME_MCP: chrome_server()}})}", *forwarded]
+        result = run_child([CLAUDE_BIN, "--setting-sources", "user,project,local", "--settings", str(snapshot), *forwarded],
+                           env=environment, tick=guard)
+        if moved:
+            print(f"csw: el modelo predeterminado {moved[-1]} se guardó en {profile_label(profile)}, "
+                  "no en la configuración compartida.", file=sys.stderr)
+        return result
+
+
+def prune_run_settings(directory, max_age=86400):
+    """Drop csw run snapshots a day old that no background session relaunches with."""
+    used = set()
+    for state in ROOT.glob("jobs/*/state.json"):
+        flags = load_json(state).get("respawnFlags")
+        if isinstance(flags, list):
+            used.update(Path(flag).name for flag in flags if isinstance(flag, str) and flag.endswith(".json"))
+    for snapshot in directory.glob("session-*.json"):
         try:
-            overlay = launch_overlay(target, current)
-            overlay.update({key: value for key, value in extra_settings.items() if key != "env"})
-            overlay["env"].update(extra_settings.get("env", {}))
-            write_json(snapshot, overlay)
-            # User scope owns MCP servers, skills and agents. Keep it enabled and
-            # override only the provider, so hooks and permission lists load once.
-            guard, moved = shared_model_guard(profile, target)
-            if provider(target) != "Claude sub" and not (forwarded and forwarded[0] in LOCAL_COMMANDS):
-                # Before the user's arguments: --mcp-config takes several values and would swallow a prompt.
-                forwarded = [f"--mcp-config={json.dumps({'mcpServers': {CHROME_MCP: chrome_server()}})}", *forwarded]
-            result = run_child([CLAUDE_BIN, "--setting-sources", "user,project,local", "--settings", str(snapshot), *forwarded],
-                               env=environment, tick=guard)
-            if moved:
-                print(f"csw: el modelo predeterminado {moved[-1]} se guardó en {profile_label(profile)}, "
-                      "no en la configuración compartida.", file=sys.stderr)
-            return result
-        finally:
-            snapshot.unlink(missing_ok=True)
+            if snapshot.name not in used and time.time() - snapshot.stat().st_mtime > max_age:
+                snapshot.unlink()
+        except OSError:
+            continue  # in use by a running Claude on Windows: next time
 
 
 def run_child(command, env, tick=None):
