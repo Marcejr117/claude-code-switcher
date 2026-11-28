@@ -2,7 +2,7 @@
 """Switch Claude Code providers while preserving shared configuration."""
 import copy
 import contextlib
-import fcntl
+import functools
 import getpass
 import importlib.util
 import json
@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -18,6 +19,12 @@ import time
 import tomllib
 import types
 import urllib.request
+
+if os.name == "nt":
+    # Pipes and hook output default to the ANSI code page; csw prints arrows and accents.
+    for _stream in (sys.stdout, sys.stderr):
+        if _stream and (_stream.encoding or "").lower() != "utf-8":
+            _stream.reconfigure(encoding="utf-8")
 
 ROOT = Path(os.environ.get("CSW_CONFIG_DIR", Path.home() / ".claude"))
 CONFIG_ROOT = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "claude-code-proxy"
@@ -39,8 +46,7 @@ GLM_PROFILE = {"env": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic", "
 DEEPSEEK_PROFILE = {"env": {"ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic", "ANTHROPIC_MODEL": "deepseek-v4-pro",
                             "CLAUDE_CODE_SUBAGENT_MODEL": "inherit", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"},
                     "model": "deepseek-v4-pro"}
-CLAUDE_PROFILE = {"env": {"CLAUDE_CODE_SUBAGENT_MODEL": "inherit", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"},
-                  "model": "default"}
+CLAUDE_PROFILE = {"env": {}, "model": "default"}  # native Claude: agents keep their own model/effort
 CODEX_PROFILE = {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:18765", "ANTHROPIC_AUTH_TOKEN": "unused",
                          "ANTHROPIC_MODEL": "gpt-5.6-sol",
                          "CLAUDE_CODE_SUBAGENT_MODEL": "inherit", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"},
@@ -67,12 +73,17 @@ PROVIDER_ENV = {
     "CLAUDE_CODE_DISABLE_1M_CONTEXT",
     "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "DISABLE_AUTO_COMPACT",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-    "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK",
+    "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK", "ENABLE_TOOL_SEARCH", "CLAUDE_CODE_AUTO_MODE_SERVER",
     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+    "CLAUDE_CODE_OAUTH_SCOPES", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
 }
 PROVIDER_FIELDS = ("model", "effortLevel", "apiKeyHelper", "forceLoginMethod", "forceLoginOrgUUID")
+LOCAL_COMMANDS = ("mcp", "plugin", "plugins", "doctor", "update", "upgrade", "install", "agents", "auth",
+                  "attach", "logs", "respawn", "rm", "stop", "kill", "project", "gateway", "import",
+                  "auto-mode", "setup-token", "ultrareview")
+CHROME_MCP = "chrome"  # Claude Code reserves "claude-in-chrome" and ignores a configured server of that name
 SHARED_RESOURCES = ("CLAUDE.md", "AGENTS.md", "agents", "skills", "commands", "workflows", "rules",
                     "hooks", "plugins", "output-styles", "themes", "keybindings.json")
 
@@ -119,7 +130,7 @@ def codex_context_budget(model):
     """
     raw = re.sub(r"\[1m\]$", "", str(model)).removesuffix("-fast")
     try:
-        catalog = json.loads(CODEX_NATIVE_CATALOG.read_text())
+        catalog = json.loads(CODEX_NATIVE_CATALOG.read_text(encoding="utf-8"))
         record = next((item for item in catalog.get("models", []) if item.get("slug") == raw), None)
         if record is None:
             return None
@@ -127,7 +138,7 @@ def codex_context_budget(model):
         maximum = record.get("max_context_window", default)
         if not isinstance(default, int) or not isinstance(maximum, int) or min(default, maximum) <= 0:
             return None
-        config = tomllib.loads(CODEX_NATIVE_CONFIG.read_text()) if CODEX_NATIVE_CONFIG.exists() else {}
+        config = tomllib.loads(CODEX_NATIVE_CONFIG.read_text(encoding="utf-8")) if CODEX_NATIVE_CONFIG.exists() else {}
         requested = config.get("model_context_window", default)
         if not isinstance(requested, int) or requested <= 0:
             requested = default
@@ -167,7 +178,7 @@ def documented_context(model, target):
     elif backend == "OrcaRouter":
         # Ventanas reales publicadas por /v1/models; sin ellas Claude asume 200K.
         try:
-            windows = json.loads((ROOT / "model-catalogs" / "orca-windows.json").read_text())
+            windows = json.loads((ROOT / "model-catalogs" / "orca-windows.json").read_text(encoding="utf-8"))
             window = windows.get(raw)
             return window if isinstance(window, int) else None
         except (OSError, ValueError):
@@ -205,6 +216,11 @@ def prefer_supported_context(target, model_override=None):
             env[key] = preferred_context_model(env[key], target)
     selected_model = model_override or effective_model(target)
     window = documented_context(selected_model, target)
+    if backend in ("Codex", "Cursor"):
+        # claude-code-proxy forwards every tool schema but not ToolSearch's tool_reference
+        # results: with deferred tools the model sees names only. It cannot answer the
+        # server-side auto-mode classifier either; without this Claude warns on every start.
+        env.update(ENABLE_TOOL_SEARCH="false", CLAUDE_CODE_AUTO_MODE_SERVER="0")
     if backend == "Codex":
         # Codex models are custom provider IDs. Claude applies MAX_CONTEXT_TOKENS
         # directly to their untagged IDs; DISABLE_1M_CONTEXT instead asks Claude
@@ -235,6 +251,23 @@ def context_label(model, target):
     return "1M" if window is not None and window >= 1000000 else f"{window // 1000}K" if window else "sin verificar"
 
 
+def codex_cli_models():
+    """What the Codex CLI /model picker lists for its signed-in account, in its order.
+
+    The proxy (>= 0.1.48) accepts every API-supported model of this same cache,
+    so these rows also work through it. Empty when Codex CLI never signed in.
+    """
+    try:
+        catalog = json.loads(CODEX_NATIVE_CATALOG.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    entries = [m for m in catalog.get("models", []) if isinstance(m, dict)
+               and m.get("visibility") == "list" and m.get("supported_in_api") is True
+               and re.fullmatch(r"gpt-[A-Za-z0-9_.-]+", str(m.get("slug", "")))]
+    entries.sort(key=lambda m: m.get("priority") if isinstance(m.get("priority"), int) else 999)
+    return [{"model": m["slug"], "label": str(m.get("display_name") or m["slug"])} for m in entries]
+
+
 def fetch_model_catalog(path, target):
     backend = provider(target)
     env = target.get("env", {})
@@ -260,15 +293,18 @@ def fetch_model_catalog(path, target):
                 rows.append({"model": "cursor:" + match[1], "label": match[2]})
         source = "Cursor CLI: catálogo de esta cuenta; compatibilidad del proxy no garantizada"
     elif backend == "Codex":
-        result = subprocess.run(["claude-code-proxy", "models"], capture_output=True, text=True, timeout=20)
-        if result.returncode:
-            raise ValueError("No se pudo consultar el catálogo del proxy")
-        line = next((x for x in result.stdout.splitlines() if x.startswith("codex: ")), "")
-        featured = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-daybreak-blue-latest", "gpt-5.5"]
-        models = [m for m in line.removeprefix("codex: ").split(", ") if m.startswith("gpt-")]
-        models.sort(key=lambda m: (featured.index(m) if m in featured else len(featured), m))
-        rows = [{"model": m, "label": "Daybreak Blue — ciberseguridad defensiva" if m == "gpt-daybreak-blue-latest" else m} for m in models]
-        source = "Catálogo del proxy; acceso sujeto a la cuenta Codex"
+        rows = codex_cli_models()
+        source = "Catálogo de Codex CLI (~/.codex): los modelos y el orden de su /model"
+        if not rows:
+            result = subprocess.run(["claude-code-proxy", "models"], capture_output=True, text=True, timeout=20)
+            if result.returncode:
+                raise ValueError("No se pudo consultar el catálogo del proxy")
+            line = next((x for x in result.stdout.splitlines() if x.startswith("codex: ")), "")
+            featured = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-daybreak-blue-latest", "gpt-5.5"]
+            models = [m for m in line.removeprefix("codex: ").split(", ") if m.startswith("gpt-")]
+            models.sort(key=lambda m: (featured.index(m) if m in featured else len(featured), m))
+            rows = [{"model": m, "label": "Daybreak Blue — ciberseguridad defensiva" if m == "gpt-daybreak-blue-latest" else m} for m in models]
+            source = "Catálogo del proxy; acceso sujeto a la cuenta Codex"
     elif backend in ("GLM", "DeepSeek"):
         endpoint = "https://api.z.ai/api/paas/v4/models" if backend == "GLM" else "https://api.deepseek.com/models"
         request = urllib.request.Request(endpoint, headers={"Authorization": "Bearer " + env.get("ANTHROPIC_AUTH_TOKEN", "")})
@@ -286,13 +322,15 @@ def fetch_model_catalog(path, target):
             data = json.load(response)
         if data.get("has_more"):
             raise ValueError("Catálogo OrcaRouter paginado; no soportado todavía")
-        rows = [{"model": m["id"], "label": m["id"], "context_length": m.get("context_length")}
+        # name is what the OrcaRouter website shows ("OrcaCyber: GLM 5.3 …"); display_name in the Anthropic format.
+        rows = [{"model": m["id"], "label": str(m.get("name") or m.get("display_name") or m["id"]),
+                 "context_length": m.get("context_length")}
                 for m in data.get("data", []) if isinstance(m.get("id"), str)]
         rows.sort(key=lambda row: row["model"] != ORCAROUTER_PROFILE["model"])
         windows = {row["model"]: row["context_length"] for row in rows if isinstance(row.get("context_length"), int)}
         windows_path = ROOT / "model-catalogs" / "orca-windows.json"
         try:
-            previous = json.loads(windows_path.read_text())
+            previous = json.loads(windows_path.read_text(encoding="utf-8"))
             if isinstance(previous, dict):
                 previous.update(windows)
                 windows = previous
@@ -448,7 +486,7 @@ def provider_key(key):
 
 
 def read_json(path):
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or not isinstance(data.get("env", {}), dict):
         raise ValueError(f"Configuración inválida: {path.name}")
     if any(not isinstance(value, (str, int, float, bool)) for value in data.get("env", {}).values()):
@@ -461,11 +499,19 @@ def atomic_write(path, text):
         raise ValueError(f"No se sustituye un enlace simbólico: {path}")
     fd, temporary = tempfile.mkstemp(prefix=".csw-", dir=path.parent)
     try:
-        with os.fdopen(fd, "w") as stream:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        for attempt in range(50):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                # Windows refuses to replace a file another process (Claude) has open for a moment.
+                if os.name != "nt" or attempt == 49:
+                    raise
+                time.sleep(0.05)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -476,11 +522,11 @@ def write_json(path, data):
 
 
 def active():
-    return ACTIVE.read_text().strip() if ACTIVE.exists() else ""
+    return ACTIVE.read_text(encoding="utf-8").strip() if ACTIVE.exists() else ""
 
 
 def names():
-    return dict(line.split("\t", 1) for line in NAMES.read_text().splitlines()
+    return dict(line.split("\t", 1) for line in NAMES.read_text(encoding="utf-8").splitlines()
                 if "\t" in line) if NAMES.exists() else {}
 
 
@@ -518,7 +564,16 @@ def resolve(value):
         if not 0 <= index < len(choices):
             raise ValueError("Índice inválido; consulta csw list")
         value = choices[index]
-    path = profile_path(ALIASES.get(value.lower(), value))
+    name = ALIASES.get(value.lower(), value)
+    if not (ROOT / name).is_file():
+        # Short names: the provider or the account alone, when only one profile matches.
+        matches = [f for f in profiles() if value.lower() in profile_label(ROOT / f).split(":")]
+        if len(matches) > 1:
+            options = ", ".join(profile_label(ROOT / f) for f in matches)
+            raise ValueError(f"Varias cuentas coinciden con {value}: {options}. Usa una de ellas o su número de csw list")
+        if matches:
+            name = matches[0]
+    path = profile_path(name)
     if not path.is_file():
         raise ValueError(f"No existe: {path.name}")
     return path
@@ -598,7 +653,7 @@ def check_proxy(target):
     target = provider_transport(target)
     if target.get("env", {}).get("ANTHROPIC_BASE_URL") == DEEPSEEK_COMPAT_URL:
         if not proxy_ready(DEEPSEEK_COMPAT_URL):
-            subprocess.run(["systemctl", "--user", "start", "csw-deepseek-compat.service"], check=True)
+            systemctl("start", "csw-deepseek-compat.service", check=True)
             for _ in range(20):
                 if proxy_ready(DEEPSEEK_COMPAT_URL):
                     break
@@ -615,7 +670,7 @@ def check_proxy(target):
         account = backend if directory == CONFIG_ROOT else f"{backend}:{directory.name.split('-', 1)[1]}"
         raise ValueError(f"Falta iniciar sesión: csw login {account}. Perfil actual conservado.")
     if not proxy_ready(url):
-        subprocess.run(["systemctl", "--user", "start", unit], check=True)
+        systemctl("start", unit, check=True)
         for _ in range(20):
             if proxy_ready(url):
                 break
@@ -624,9 +679,18 @@ def check_proxy(target):
             raise ValueError("El proxy no responde. Consulta csw doctor; perfil actual conservado.")
 
 
+@functools.cache
+def portable_module():
+    return support_module("portable")
+
+
+def systemctl(*args, check=False, capture_output=False):
+    return portable_module().systemctl(list(args), ROOT, CONFIG_ROOT, check=check, capture_output=capture_output)
+
+
 def locked():
     stream = (ROOT / ".csw.lock").open("a")
-    fcntl.flock(stream, fcntl.LOCK_EX)
+    portable_module().flock(stream)
     return stream
 
 
@@ -636,7 +700,7 @@ def account_lock(path, exclusive=False):
     directory.mkdir(mode=0o700, exist_ok=True)
     with (directory / (path.name + ".lock")).open("a") as stream:
         try:
-            fcntl.flock(stream, (fcntl.LOCK_EX | fcntl.LOCK_NB) if exclusive else fcntl.LOCK_SH)
+            portable_module().flock(stream, exclusive=exclusive, blocking=not exclusive)
         except BlockingIOError:
             raise ValueError("Esta cuenta tiene una sesión o login abierto; ciérralo antes de retirarla") from None
         yield
@@ -652,10 +716,121 @@ def account_directory(path):
     return CONFIG_ROOT / "accounts" / f"{backend}-{slug}", f"claude-code-proxy@{backend}-{slug}.service"
 
 
+def global_config():
+    # Claude keeps .claude.json beside its default directory, but inside a custom CLAUDE_CONFIG_DIR.
+    return ROOT.parent / ".claude.json" if ROOT == Path.home() / ".claude" else ROOT / ".claude.json"
+
+
+def load_json(path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def update_global_config(change):
+    """Edit Claude's own .claude.json; an unreadable file is left alone, never rebuilt."""
+    path = global_config()
+    data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Configuración inválida: {path.name}")
+    before = copy.deepcopy(data)
+    change(data)
+    if data != before:
+        write_json(path, data)
+
+
+def claude_login():
+    """Profile whose Claude login sits in ROOT, the store Claude Code itself uses and renews."""
+    marker = ROOT / ".claude-login"
+    name = marker.read_text(encoding="utf-8").strip() if marker.is_file() else ""
+    return name if name and (ROOT / name).is_file() else ALIASES["claude"]
+
+
+def claude_stash(path):
+    return account_directory(path)[0] or ROOT / "accounts/claude/_primary"
+
+
+def claude_store(path):
+    """Where a Claude profile's login lives: ROOT while it is the selected one, its own directory otherwise."""
+    if path.name == claude_login() or not path.name.startswith("settings.json.CLAUDE."):
+        return ROOT
+    return claude_stash(path)
+
+
+def select_claude_login(path):
+    """Make a Claude account the native login.
+
+    Its tokens and account metadata move into ROOT, so Claude Code, the IDE extension,
+    Claude in Chrome and the claude.ai connectors use and renew them as after /login.
+    Pinning an access token in settings.json instead expired within hours and turned
+    login-gated features off. The outgoing account keeps its (renewed) login in its
+    own directory for the next switch.
+    """
+    if path.name == claude_login():
+        return
+    source = claude_stash(path)
+    incoming = load_json(source / ".credentials.json").get("claudeAiOauth")
+    if not isinstance(incoming, dict) or not incoming.get("refreshToken"):
+        raise ValueError(f"Falta el login de esa cuenta: csw login {profile_label(path)}")
+    # A csw run session of this account renews the stored copy; taking it now would fork the login.
+    with account_lock(path, exclusive=True):
+        live_path = ROOT / ".credentials.json"
+        live = load_json(live_path)
+        stash = claude_stash(ROOT / claude_login())
+        account = load_json(source / ".claude.json").get("oauthAccount")
+
+        def swap(config):
+            if live.get("claudeAiOauth"):
+                stash.mkdir(mode=0o700, parents=True, exist_ok=True)
+                write_json(stash / ".credentials.json",
+                           {**load_json(stash / ".credentials.json"), "claudeAiOauth": live["claudeAiOauth"]})
+                if config.get("oauthAccount"):
+                    write_json(stash / ".claude.json",
+                               {**load_json(stash / ".claude.json"), "oauthAccount": config["oauthAccount"]})
+            # Without metadata Claude fetches the profile again on its next start.
+            config.pop("oauthAccount", None)
+            if account:
+                config["oauthAccount"] = account
+
+        update_global_config(swap)
+        write_json(live_path, {**live, "claudeAiOauth": incoming})
+        atomic_write(ROOT / ".claude-login", path.name + "\n")
+
+
+def chrome_server():
+    return {"command": shutil.which(CLAUDE_BIN) or CLAUDE_BIN, "args": ["--claude-in-chrome-mcp"]}
+
+
+def publish_chrome(external):
+    """Give other providers the browser too.
+
+    Claude Code enables Claude in Chrome only with a claude.ai login, but the bridge to
+    the extension works as a plain MCP server: navigation, page reading and screenshots
+    (vision, when the model accepts images). Native Claude keeps its built-in integration.
+    """
+    def change(config):
+        servers = config.get("mcpServers")
+        servers = servers if isinstance(servers, dict) else {}
+        ours = isinstance(servers.get(CHROME_MCP), dict) and servers[CHROME_MCP].get("args") == ["--claude-in-chrome-mcp"]
+        if external and (ours or CHROME_MCP not in servers):
+            servers[CHROME_MCP] = chrome_server()
+            config["mcpServers"] = servers
+        elif not external and ours:
+            del servers[CHROME_MCP]
+
+    update_global_config(change)
+
+
 def legacy_session_running(path, target):
     directory, _ = account_directory(path)
     url = target.get("env", {}).get("ANTHROPIC_BASE_URL", "")
     key = target.get("env", {}).get("ANTHROPIC_AUTH_TOKEN", "")
+    if os.name == "nt":
+        # ponytail: Windows cannot read another process's environment; account_lock
+        # still catches every session opened with csw run, only bare launches are missed.
+        return False
     for process in Path("/proc").glob("[0-9]*"):
         try:
             if process.stat().st_uid != os.getuid():
@@ -683,6 +858,8 @@ def remove_account(value):
             raise ValueError("Esta cuenta está seleccionada en una sesión csw hot; cambia esa sesión antes de retirarla")
         if path.name == active():
             raise ValueError("Es el perfil seleccionado. Selecciona otro con csw antes de retirarlo")
+        if path.name == claude_login() and account_directory(path)[0] is not None:
+            raise ValueError("Su login es el de Claude ahora mismo. Selecciona otra cuenta Claude antes de retirarla")
         target = read_json(path)
         if legacy_session_running(path, target):
             raise ValueError("Hay una sesión de Claude usando esta conexión; ciérrala antes de retirarla")
@@ -702,8 +879,8 @@ def remove_account(value):
         archive = Path(tempfile.mkdtemp(prefix=identifier.replace(":", "-") + "-", dir=archive_root))
         enabled = running = False
         if unit:
-            enabled = subprocess.run(["systemctl", "--user", "is-enabled", unit], capture_output=True).returncode == 0
-            running = subprocess.run(["systemctl", "--user", "is-active", unit], capture_output=True).returncode == 0
+            enabled = systemctl("is-enabled", unit, capture_output=True).returncode == 0
+            running = systemctl("is-active", unit, capture_output=True).returncode == 0
         metadata = {"profile": path.name, "label": labels.get(path.name, profile_label(path)),
                     "has_directory": bool(directory and directory.exists()), "enabled": enabled, "running": running,
                     "has_catalog": model_cache(path).is_file()}
@@ -711,7 +888,7 @@ def remove_account(value):
         moved = []
         try:
             if unit:
-                subprocess.run(["systemctl", "--user", "disable", "--now", unit], check=True, capture_output=True)
+                systemctl("disable", "--now", unit, check=True, capture_output=True)
             path.rename(archive / "profile.json")
             moved.append((archive / "profile.json", path))
             if metadata["has_directory"]:
@@ -726,9 +903,9 @@ def remove_account(value):
             for archived, original in reversed(moved):
                 archived.rename(original)
             if unit and enabled:
-                subprocess.run(["systemctl", "--user", "enable", unit], capture_output=True)
+                systemctl("enable", unit, capture_output=True)
             if unit and running:
-                subprocess.run(["systemctl", "--user", "start", unit], capture_output=True)
+                systemctl("start", unit, capture_output=True)
             raise
     print(f"Retirado: {identifier}. Copia privada recuperable: {archive}")
     print(f"Restaurar: csw restore {archive.name}")
@@ -771,13 +948,28 @@ def restore_account(identifier):
             path.rename(archive / "profile.json")
             raise
     if unit and metadata.get("enabled"):
-        subprocess.run(["systemctl", "--user", "enable", unit], check=True, capture_output=True)
+        systemctl("enable", unit, check=True, capture_output=True)
     print(f"Restaurado: {profile_label(path)}. Selección actual conservada; para abrir: csw run {profile_label(path)}")
 
 
 def reloadable_settings(current, target, path):
     """Publish the route in user settings, without pinning the in-session model."""
-    target = hot_module().credentials(types.SimpleNamespace(**globals()), path, target)
+    # The selected Claude login lives in ROOT itself (select_claude_login): Claude Code
+    # (CLI, IDE extension, Claude in Chrome) uses and refreshes it natively. Pinning an
+    # access token here made it expire within hours, blocked prompts and disabled
+    # login-gated features.
+    if provider(target) == "Claude sub":
+        try:
+            store = hot_module().oauth_store(types.SimpleNamespace(**globals()), path)
+        except (OSError, ValueError):
+            store = {}
+        if not (store.get("accessToken") or store.get("refreshToken")):
+            raise ValueError("Falta el login de Claude: ejecuta claude y usa /login")
+        target = provider_transport(target)
+        for key in ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_SCOPES", "ANTHROPIC_BASE_URL"):
+            target.get("env", {}).pop(key, None)  # republishing the active profile starts from live settings
+    else:
+        target = provider_transport(target)
     target["model"] = effective_model(target)
     prefer_supported_context(target)
     configure_model_picker(target, path)
@@ -790,8 +982,6 @@ def reloadable_settings(current, target, path):
         merged["env"][key] = ""
     merged["env"].update({k: v for k, v in target.get("env", {}).items() if provider_key(k)})
     merged["env"].update(ANTHROPIC_MODEL="", CSW_PROFILE=profile_label(path), CSW_PROVIDER=provider(target))
-    if provider(target) == "Claude sub":
-        merged["env"]["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
     merged["apiKeyHelper"] = target.get("apiKeyHelper", "")
     merged["modelPicker"] = target["modelPicker"]
     shared_module().install(types.SimpleNamespace(**globals()), merged)
@@ -805,6 +995,8 @@ def switch(value):
         same = path.name == active()
         target = copy.deepcopy(current) if same else read_json(path)
         check_proxy(target)
+        if provider(target) == "Claude sub":
+            select_claude_login(path)
         merged = reloadable_settings(current, target, path)
         previous = profile_path(active()) if active() else ROOT / "settings.json.autosave"
         for destination in (LIVE, ACTIVE, previous):
@@ -816,11 +1008,11 @@ def switch(value):
             write_json(LIVE, merged)
         if not same:
             atomic_write(ACTIVE, path.name + "\n")
+        publish_chrome(provider(merged) != "Claude sub")
     print(f"settings.json → {names().get(path.name, profile_label(path))} ({provider(merged)})")
-    print("No se ha abierto ni reiniciado Claude. El cambio se publica aunque haya turnos, subagentes o goals activos.")
-    print("Una petición ya enviada termina con la cuenta anterior; las nuevas usarán la elegida cuando Claude recargue settings.json.")
-    print("Espera un par de segundos. Si el modelo actual no pertenece a la cuenta nueva, usa /model antes del siguiente mensaje.")
-    print("Las sesiones antiguas con --settings/csw run, y las sesiones hot aisladas, conservan su conexión.")
+    print("Los Claude abiertos lo recargan solos en unos segundos; si su modelo no es de esta cuenta, usa /model.")
+    if provider(merged) != "Claude sub":
+        print(f"Navegador: la extensión de Claude va como servidor MCP «{CHROME_MCP}» en las sesiones nuevas.")
     if provider(merged) == "Cursor":
         print("Cursor: texto comprobado; su adaptador no admite todavía las herramientas nativas. Esas llamadas devuelven un error explícito.")
 
@@ -831,6 +1023,7 @@ def show_list(archives=False):
         print("Sin perfiles todavía. Crea uno: csw add glm|deepseek|orcarouter|claude|codex|cursor <nombre>")
         return
     labels = names()
+    width = max(len(profile_label(ROOT / name)) for name in entries)
     for index, name in enumerate(entries, 1):
         try:
             backend = provider(read_json(ROOT / name))
@@ -840,7 +1033,7 @@ def show_list(archives=False):
         marker = ">" if name == active() else " "
         number = "-" if archives else str(index)
         model = effective_model(selected_data(ROOT / name)) if backend != "JSON inválido" else "—"
-        print(f"{marker} {number:>2}  {alias:<16} {labels.get(name, name):<27} {backend:<10} {model}")
+        print(f"{marker} {number:>2}  {alias:<{width}}  {backend:<10} {model}")
     if archives:
         print("Los archivos históricos se activan por nombre completo; los índices son los de csw list.")
 
@@ -859,51 +1052,38 @@ def set_name(path, label):
 
 
 def doctor():
-    problems = []
-    for alias, filename in ALIASES.items():
+    """One line per account you actually have: what is missing and the command that fixes it."""
+    problems = 0
+    entries = profiles()
+    width = max((len(profile_label(ROOT / name)) for name in entries), default=0)
+    for name in entries:
+        path = ROOT / name
+        label = profile_label(path)
+        backend, fix = "?", ""
         try:
-            data = read_json(ROOT / filename)
-            print(f"{alias}: configuración válida; {provider(data)}")
-        except (OSError, ValueError):
-            problems.append(alias)
-            print(f"{alias}: falta el perfil o su JSON es inválido")
-    environment = {k: v for k, v in os.environ.items() if not provider_key(k)}
-    try:
-        environment.pop("CLAUDE_CONFIG_DIR", None)
-        status = subprocess.run([CLAUDE_BIN, "--setting-sources", "", "auth", "status", "--json"],
-                                capture_output=True, text=True, timeout=20, env=environment)
-        native_login = json.loads(status.stdout).get("loggedIn") is True
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        native_login = False
-    print("Claude sub: " + ("login presente" if native_login else "pendiente: csw login claude"))
-    if not native_login:
-        problems.append("claude-login")
-    ready = proxy_ready()
-    print("Proxy local: " + ("responde" if ready else "no responde"))
-    if not ready:
-        problems.append("proxy")
-    for backend in ("codex", "cursor"):
-        try:
-            _, environment, _ = proxy_context(read_json(ROOT / ALIASES[backend]))
-            present = authenticated(backend, environment)
-        except (OSError, subprocess.TimeoutExpired):
-            present = False
-        print(f"{backend}: " + ("credenciales presentes" if present else f"pendiente: csw login {backend}"))
-        if not present:
-            problems.append(backend)
-    for path in sorted((CONFIG_ROOT / "accounts").glob("*/config.json")):
-        data = read_json(path)
-        target = {"env": {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{data['port']}"}}
-        url, environment, _ = proxy_context(target)
-        backend = path.parent.name.split("-", 1)[0]
-        present = authenticated(backend, environment)
-        ready = proxy_ready(url)
-        print(f"{path.parent.name}: credenciales={'sí' if present else 'pendientes'}, proxy={'activo' if ready else 'parado'}")
-        if not present or not ready:
-            problems.append(path.parent.name)
+            data = selected_data(path)
+            backend = provider(data)
+            if backend == "Claude sub":
+                store = load_json(claude_store(path) / ".credentials.json").get("claudeAiOauth")
+                state = "login presente"
+                if not (isinstance(store, dict) and (store.get("accessToken") or store.get("refreshToken"))):
+                    fix = f"falta el login: csw login {label}"
+            elif backend in ("Codex", "Cursor"):
+                url, environment, _ = proxy_context(data)
+                state = "login presente; proxy " + ("activo" if proxy_ready(url) else "parado (arranca al seleccionarla)")
+                if not authenticated(backend.lower(), environment):
+                    fix = f"falta el login: csw login {label}"
+            else:
+                state = "clave guardada"
+                if not data.get("env", {}).get("ANTHROPIC_AUTH_TOKEN"):
+                    fix = f"falta la clave API: csw remove {label} y vuelve a crearla con csw add"
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            fix = str(error)
+        problems += bool(fix)
+        print(f"{'!!' if fix else 'ok'}  {label:<{width}}  {backend:<10} {fix or state}")
+    if not entries:
+        print("Sin cuentas. Crea una: csw add glm|deepseek|orcarouter|claude|codex|cursor <nombre>")
     print("Comprobación local; no verifica cuota ni una respuesta del proveedor.")
-    print("Cursor: herramientas nativas incompatibles con este adaptador; ahora se notifican como error, no como una tarea completada.")
-    problems.append("cursor-tools")
     return 1 if problems else 0
 
 
@@ -913,7 +1093,7 @@ def native_environment(profile):
     if ROOT != Path.home() / ".claude":
         environment["CLAUDE_CONFIG_DIR"] = str(ROOT)
     account = re.fullmatch(r"settings\.json\.CLAUDE\.([a-z0-9_-]+)\.bak", profile.name)
-    if account:
+    if account and profile.name != claude_login():  # the selected account's login is ROOT's
         directory = ROOT / "accounts" / "claude" / account[1]
         if not directory.is_dir():
             raise ValueError("No existe el directorio de sesión de esa cuenta Claude")
@@ -927,7 +1107,18 @@ def ensure_native_links(directory):
         source = ROOT / name
         destination = directory / name
         if source.exists() and not destination.exists() and not destination.is_symlink():
-            destination.symlink_to(source, target_is_directory=source.is_dir())
+            try:
+                destination.symlink_to(source, target_is_directory=source.is_dir())
+            except OSError:
+                if os.name != "nt":
+                    raise
+                # Windows without Developer Mode: junctions and hard links need no privilege.
+                # ponytail: a hard-linked file detaches if an editor replaces it instead of writing in place.
+                if source.is_dir():
+                    import _winapi
+                    _winapi.CreateJunction(str(source), str(destination))
+                else:
+                    os.link(source, destination)
 
 
 def prepare_native_account(slug, target):
@@ -968,9 +1159,52 @@ def perform_login(value, device=None, browser=False):
     auth_command = "device" if backend == "codex" and not browser else "login"
     result = subprocess.call(["claude-code-proxy", backend, "auth", auth_command], env=environment)
     if result == 0:
-        subprocess.run(["systemctl", "--user", "enable", "--now", unit], check=True)
+        systemctl("enable", "--now", unit, check=True)
         print(f"Cuenta lista. Para seleccionarla: csw {value}")
     return result
+
+
+def rename_account(value, slug):
+    kinds = {"Claude sub": ("CLAUDE", "Claude"), "GLM": ("GLM", "GLM"), "DeepSeek": ("DEEPSEEK", "DeepSeek"),
+             "OrcaRouter": ("ORCAROUTER", "OrcaRouter")}
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", slug):
+        raise ValueError("Nombre en minúsculas, números, guion o guion bajo")
+    path = resolve(value)
+    with locked(), account_lock(path, exclusive=True):
+        target = read_json(path)
+        if provider(target) not in kinds:
+            # ponytail: a proxy account's login directory, port and service carry its name; remove and add instead.
+            raise ValueError("Las cuentas de Codex y Cursor no se renombran: su login y su servicio llevan el nombre")
+        if hot_module().profile_in_use(types.SimpleNamespace(**globals()), path.name):
+            raise ValueError("Esta cuenta está seleccionada en una sesión csw hot; cambia esa sesión antes")
+        kind, title = kinds[provider(target)]
+        new = profile_path(f"settings.json.{kind}.{slug}.bak")
+        directory = account_directory(new)[0]
+        if new.exists() or (directory and directory.exists()):
+            raise ValueError(f"Ya existe: {profile_label(new)}")
+        was_login, was_active = path.name == claude_login(), path.name == active()
+        stash, catalog = claude_stash(path), model_cache(path)
+        path.rename(new)
+        if directory:  # Claude: the stored login follows the name
+            if stash.exists():
+                directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                stash.rename(directory)
+            else:
+                prepare_native_account(slug, target)
+            if was_login:
+                atomic_write(ROOT / ".claude-login", new.name + "\n")
+        if catalog.is_file():
+            catalog.rename(model_cache(new))
+        labels = names()
+        labels.pop(path.name, None)
+        labels[new.name] = f"{title} ({slug})"
+        atomic_write(NAMES, "".join(f"{key}\t{label}\n" for key, label in labels.items()))
+        if was_active:
+            atomic_write(ACTIVE, new.name + "\n")
+    if was_active:
+        switch(profile_label(new))  # open sessions check CSW_PROFILE
+    else:
+        print(f"Renombrada: {profile_label(new)}")
 
 
 def account_seed(backend):
@@ -1045,10 +1279,7 @@ def launch_claude(args):
     for key in ("CSW_HOT_ID", "CSW_HOT_REVISION"):
         environment.pop(key, None)
     environment.pop("CSW_SHARED_DISABLED", None)
-    local = bool(forwarded and forwarded[0] in (
-        "mcp", "plugin", "plugins", "doctor", "update", "upgrade", "install", "agents", "auth",
-        "attach", "logs", "respawn", "rm", "stop", "kill", "project", "gateway", "import",
-        "auto-mode", "setup-token", "ultrareview"))
+    local = bool(forwarded and forwarded[0] in LOCAL_COMMANDS)
     if not local and not any(arg in ("--version", "-v", "--help", "-h") for arg in forwarded):
         target = read_json(LIVE)
         model = effective_model(target)
@@ -1062,7 +1293,14 @@ def launch_claude(args):
         forwarded = [*forwarded, "--model", model]
         environment["CSW_INITIAL_MODEL"] = model
     # No --settings snapshot or provider credentials. Claude watches ROOT itself.
-    return os.execvpe(CLAUDE_BIN, [CLAUDE_BIN, *forwarded], environment)
+    return exec_claude(CLAUDE_BIN, [CLAUDE_BIN, *forwarded], environment)
+
+
+def exec_claude(file, argv, environment):
+    if os.name == "nt":
+        # exec on Windows spawns and exits, handing the console back mid-session.
+        return run_child(argv, env=environment)
+    return os.execvpe(file, argv, environment)
 
 
 def run_claude(args):
@@ -1077,7 +1315,8 @@ def run_claude(args):
     target = provider_transport(target)
     if provider(target) == "Claude sub":
         # Isolated native sessions own their canonical login store and renewal.
-        target.setdefault("env", {}).pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        for key in ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_SCOPES"):
+            target.setdefault("env", {}).pop(key, None)
     prefer_supported_context(target)
     if profile is None:
         profile = LIVE
@@ -1111,19 +1350,110 @@ def run_claude(args):
         environment["CSW_PROVIDER"] = provider(target)
         directory = ROOT / "run-settings"
         directory.mkdir(mode=0o700, exist_ok=True)
+        prune_run_settings(directory)
         fd, filename = tempfile.mkstemp(prefix="session-", suffix=".json", dir=directory)
         os.close(fd)
+        # Kept after Claude exits: background sessions created from this one are
+        # relaunched with the same --settings path and hang at "opening" without it.
         snapshot = Path(filename)
+        overlay = launch_overlay(target, current)
+        overlay.update({key: value for key, value in extra_settings.items() if key != "env"})
+        overlay["env"].update(extra_settings.get("env", {}))
+        write_json(snapshot, overlay)
+        # User scope owns MCP servers, skills and agents. Keep it enabled and
+        # override only the provider, so hooks and permission lists load once.
+        guard, moved = shared_model_guard(profile, target)
+        if provider(target) != "Claude sub" and not (forwarded and forwarded[0] in LOCAL_COMMANDS):
+            # Before the user's arguments: --mcp-config takes several values and would swallow a prompt.
+            forwarded = [f"--mcp-config={json.dumps({'mcpServers': {CHROME_MCP: chrome_server()}})}", *forwarded]
+        result = run_child([CLAUDE_BIN, "--setting-sources", "user,project,local", "--settings", str(snapshot), *forwarded],
+                           env=environment, tick=guard)
+        if moved:
+            print(f"csw: el modelo predeterminado {moved[-1]} se guardó en {profile_label(profile)}, "
+                  "no en la configuración compartida.", file=sys.stderr)
+        return result
+
+
+def prune_run_settings(directory, max_age=86400):
+    """Drop csw run snapshots a day old that no background session relaunches with."""
+    used = set()
+    for state in ROOT.glob("jobs/*/state.json"):
+        flags = load_json(state).get("respawnFlags")
+        if isinstance(flags, list):
+            used.update(Path(flag).name for flag in flags if isinstance(flag, str) and flag.endswith(".json"))
+    for snapshot in directory.glob("session-*.json"):
         try:
-            overlay = launch_overlay(target, current)
-            overlay.update({key: value for key, value in extra_settings.items() if key != "env"})
-            overlay["env"].update(extra_settings.get("env", {}))
-            write_json(snapshot, overlay)
-            # User scope owns MCP servers, skills and agents. Keep it enabled and
-            # override only the provider, so hooks and permission lists load once.
-            return subprocess.call([CLAUDE_BIN, "--setting-sources", "user,project,local", "--settings", str(snapshot), *forwarded], env=environment)
-        finally:
-            snapshot.unlink(missing_ok=True)
+            if snapshot.name not in used and time.time() - snapshot.stat().st_mtime > max_age:
+                snapshot.unlink()
+        except OSError:
+            continue  # in use by a running Claude on Windows: next time
+
+
+def run_child(command, env, tick=None):
+    """Wait for Claude like exec would: Ctrl-C belongs to Claude (cancel a turn).
+
+    subprocess.call would kill Claude when Ctrl-C reached this launcher too.
+    tick runs about once a second while Claude is open.
+    """
+    child = subprocess.Popen(command, env=env)
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        while True:
+            try:
+                return child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                if tick:
+                    tick()
+    finally:
+        signal.signal(signal.SIGINT, previous)
+        if tick:
+            tick()
+
+
+def shared_model_guard(profile, target):
+    """Keep "/model … set as default" of an isolated csw run out of settings.json.
+
+    Claude saves that default to the user settings.json, which csw run shares
+    with every native session; a model of the run's provider there breaks them
+    (e.g. gpt-* sent to Anthropic). It is put back and kept in the run profile.
+    """
+    state = {"valid": read_json(LIVE).get("model")}
+    moved = []
+
+    def belongs(model, data):
+        try:
+            normalize_model(model, data)
+            return True
+        except ValueError:
+            return False
+
+    def guard():
+        try:
+            check()
+        except (OSError, ValueError):
+            pass  # settings.json mid-write or briefly locked: retry on the next tick
+
+    def check():
+        with locked():
+            live = read_json(LIVE)
+            chosen = live.get("model")
+            if (chosen == state["valid"] or not isinstance(chosen, str) or belongs(chosen, live)
+                    or not belongs(chosen, target)):
+                state["valid"] = chosen  # unchanged, or a native session's own choice
+                return
+            if state["valid"] is None:
+                live.pop("model", None)
+            else:
+                live["model"] = state["valid"]
+            write_json(LIVE, live)
+            if profile != LIVE and profile.is_file():
+                data = read_json(profile)
+                data["model"] = chosen
+                if data.get("env", {}).get("ANTHROPIC_MODEL"):
+                    data["env"]["ANTHROPIC_MODEL"] = chosen
+                write_json(profile, data)
+            moved.append(chosen)
+    return guard, moved
 
 
 def extract_extra_settings(args):
@@ -1155,6 +1485,7 @@ def launch_overlay(target, inherited):
     # Empty credential values mask the previous provider without changing disk.
     keys = {key for key in inherited.get("env", {}) if provider_key(key)}
     keys.update(("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+                 "CLAUDE_CODE_OAUTH_SCOPES",
                  "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"))
     env = {key: "" for key in keys}
     env.update({key: value for key, value in target.get("env", {}).items() if provider_key(key)})
@@ -1214,9 +1545,13 @@ def main(args):
         prefer_supported_context(data)
         print(f"Perfil: {profile_label(ROOT / active()) if active() else 'sin marcar'}\nProveedor: {provider(data)}\nModelo principal: {effective_model(data)}")
         env = data.get("env", {})
-        print(f"Contexto documentado/configurado: {context_label(effective_model(data), data)}\nVentana de compactación: {env.get('CLAUDE_CODE_AUTO_COMPACT_WINDOW', 'automática nativa')} tokens (Claude reserva su margen interno)")
+        compact = env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+        print(f"Contexto documentado/configurado: {context_label(effective_model(data), data)}\nVentana de compactación: {compact + ' tokens' if compact else 'automática'}")
         subagents = env.get("CLAUDE_CODE_SUBAGENT_MODEL")
-        subagents = "heredan el /model y /effort vivos de la sesión" if subagents in (None, "", "inherit") else subagents
+        if provider(data) == "Claude sub" and not subagents:
+            subagents = "usan el modelo y esfuerzo que pida cada agente"
+        elif subagents in (None, "", "inherit"):
+            subagents = "heredan el /model y /effort vivos de la sesión"
         print(f"Modelo auxiliar: {env.get('ANTHROPIC_SMALL_FAST_MODEL', 'predeterminado del proveedor')}\nSubagentes nuevos: {subagents}")
         print("Configuración compartida de settings.json; el modelo de cada sesión aparece en su barra de estado.")
     elif args[0] == "models":
@@ -1230,6 +1565,8 @@ def main(args):
         remove_account(args[1])
     elif args[0] == "restore" and len(args) == 2:
         restore_account(args[1])
+    elif args[0] == "rename" and len(args) == 3:
+        rename_account(args[1], args[2])
     elif args[0] == "statusline":
         payload = json.load(sys.stdin)
         try:
@@ -1245,7 +1582,7 @@ def main(args):
             return 2  # Claude blocking-hook status; no accidental provider request.
     elif args[0] == "inherit-hook":
         try:
-            print(json.dumps(shared_module().inherit_tool(types.SimpleNamespace(**globals()), json.load(sys.stdin))))
+            print(json.dumps(shared_module().inherit_tool(types.SimpleNamespace(**globals()), json.load(sys.stdin.buffer))))
         except Exception as error:
             print(f"csw: no se pudo aplicar la herencia: {error}", file=sys.stderr)
             return 2  # Fail closed: never run a workflow with silently wrong routing.

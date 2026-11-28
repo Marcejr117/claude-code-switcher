@@ -236,6 +236,41 @@ class HotTest(unittest.TestCase):
         self.assertEqual(self.read_state()["agents"], [])
         self.assertNotIn("agents_started", self.read_state())
 
+    def test_idle_background_job_releases_a_turn_that_never_reported_stop(self):
+        root = self.directory / "claude"
+        transcript = root / "projects" / "proj" / "0c239207-full-session-id.jsonl"
+        transcript.parent.mkdir(parents=True)
+        csw.atomic_write(transcript, "")
+        job = root / "jobs" / "0c239207" / "state.json"
+        job.parent.mkdir(parents=True)
+        state = {"busy": True, "busy_since": 100.0, "agents": [], "transcript_path": str(transcript)}
+
+        def write(tempo, tasks, when):
+            csw.write_json(job, {"tempo": tempo, "inFlight": {"tasks": tasks, "queued": 0},
+                                 "updatedAt": hot.datetime.fromtimestamp(when, hot.timezone.utc).isoformat()})
+        for tempo, tasks, when in (("busy", 0, 200), ("idle", 1, 200), ("idle", 0, 50)):
+            write(tempo, tasks, when)
+            with self.subTest(tempo=tempo, tasks=tasks, when=when), self.assertRaisesRegex(ValueError, "trabajando"):
+                hot.ensure_model_switch_idle(dict(state))
+        write("idle", 0, 200)
+        hot.ensure_model_switch_idle(state)
+        self.assertFalse(state["busy"])
+
+    def test_finished_nested_subagent_releases_model_switch(self):
+        # A grandchild agent's notification goes to its parent agent; only its meta file says it ended.
+        transcript = self.directory / "nested.jsonl"
+        csw.atomic_write(transcript, json.dumps({"type": "queue-operation", "content": "<task-id>grandchild</task-id>"}) + "\n")
+        self.call("SessionStart", session_id="test-session", transcript_path=str(transcript))
+        self.call("SubagentStart", agent_id="grandchild")
+        meta = self.directory / "nested" / "subagents" / "agent-grandchild.meta.json"
+        meta.parent.mkdir(parents=True)
+        csw.write_json(meta, {"finished": False})
+        with self.assertRaisesRegex(ValueError, "subagentes"):
+            self.call("PreModelSwitch", to_model="deepseek-flash")
+        csw.write_json(meta, {"finished": True})
+        self.assertEqual(self.call("PreModelSwitch", to_model="deepseek-flash"), {})
+        self.assertEqual(self.read_state()["agents"], [])
+
     def test_project_overrides_and_reload_races_block_requests(self):
         env = self.environment()
         for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "CSW_HOT_REVISION"):
@@ -338,8 +373,10 @@ class HotTest(unittest.TestCase):
     def test_private_state_and_no_secret_in_model_picker(self):
         settings = csw.read_json(self.directory / "settings.json")
         self.assertNotIn("test-deepseek-key", str(settings["modelPicker"]))
-        self.assertEqual((self.directory / "state.json").stat().st_mode & 0o777, 0o600)
-        self.assertEqual((self.directory / "settings.json").stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":  # POSIX modes only; Windows relies on the profile ACL
+            self.assertEqual((self.directory / "state.json").stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":  # POSIX modes only; Windows relies on the profile ACL
+            self.assertEqual((self.directory / "settings.json").stat().st_mode & 0o777, 0o600)
 
     def test_default_menu_opens_guided_home_in_a_terminal(self):
         ui = csw.ui_module()

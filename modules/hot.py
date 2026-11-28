@@ -6,8 +6,7 @@ Claude access tokens are read from their owning account, never refresh tokens.
 """
 import contextlib
 import copy
-from datetime import datetime
-import fcntl
+from datetime import datetime, timezone
 import importlib.machinery
 import importlib.util
 import json
@@ -21,6 +20,9 @@ import sys
 import time
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import portable  # noqa: E402
+
 EVENTS = ("SessionStart", "UserPromptSubmit", "Stop", "StopFailure", "SubagentStart",
           "SubagentStop", "PreModelSwitch", "PostModelSwitch")
 LABELS = {"Codex": "OpenAI / Codex", "Claude sub": "Claude / Max", "Cursor": "Cursor",
@@ -29,7 +31,7 @@ ORDER = list(LABELS)
 
 
 def load_api():
-    loader = importlib.machinery.SourceFileLoader("csw_hot_api", str(Path.home() / ".local/bin/csw"))
+    loader = importlib.machinery.SourceFileLoader("csw_hot_api", str(portable.CSW_BIN))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     api = importlib.util.module_from_spec(spec)
     loader.exec_module(api)
@@ -37,12 +39,7 @@ def load_api():
 
 
 def process_identity(pid):
-    try:
-        # comm can contain spaces and parentheses; starttime is field 22.
-        fields = Path(f"/proc/{int(pid)}/stat").read_text().rsplit(")", 1)[1].split()
-        return fields[19] if fields[0] != "Z" else None
-    except (OSError, ValueError, IndexError, TypeError):
-        return None
+    return portable.process_start(pid)
 
 
 def running(state):
@@ -65,7 +62,7 @@ def session_path(api, identifier):
 @contextlib.contextmanager
 def session_lock(directory):
     with (directory / ".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        portable.flock(lock)
         yield
 
 
@@ -280,6 +277,15 @@ def _clear_finished_agents(state):
                 latest[agent] = (status, receipt.timestamp())
     except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
         return False
+    # An agent started by another agent reports to its parent, never to this transcript.
+    # Claude marks every finished agent in its subagents/<id>.meta.json.
+    for agent in pending - latest.keys():
+        meta = Path(filename[:-len(".jsonl")]) / "subagents" / f"agent-{agent}.meta.json"
+        try:
+            if json.loads(meta.read_text(encoding="utf-8")).get("finished") is True:
+                latest[agent] = ("completed", meta.stat().st_mtime)
+        except (OSError, ValueError, AttributeError):
+            continue
     for agent, (status, ended) in _workflow_agent_states(state, pending).items():
         if (status not in ("completed", "failed") or agent not in latest
                 or ended is not None and ended >= latest[agent][1]):
@@ -301,7 +307,35 @@ def _clear_finished_agents(state):
     return True
 
 
+def _clear_idle_job(state):
+    """Background sessions publish their own state: idle with nothing in flight is authoritative.
+
+    A turn whose request fails at once can end without Stop or StopFailure, which left the
+    session marked busy and /model blocked for good.
+    """
+    filename = state.get("transcript_path")
+    if not (state.get("busy") or state.get("agents")) or not isinstance(filename, str) or not filename.endswith(".jsonl"):
+        return False
+    transcript = Path(filename)
+    try:
+        jobs = transcript.parents[2] / "jobs"  # named by the short id (daemonShort)
+        job = json.loads(next(p for p in (jobs / transcript.stem[:8] / "state.json", jobs / transcript.stem / "state.json")
+                              if p.is_file()).read_text(encoding="utf-8"))
+        flight = job.get("inFlight") or {}
+        updated = datetime.fromisoformat(job["updatedAt"].replace("Z", "+00:00")).timestamp()
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, StopIteration):
+        return False
+    started = max([state.get("busy_since") or 0, *(state.get("agents_started") or {}).values()])
+    if job.get("tempo") != "idle" or flight.get("tasks") != 0 or flight.get("queued") != 0 or updated < started:
+        return False
+    state.update(busy=False, agents=[])
+    state.pop("busy_since", None)
+    state.pop("agents_started", None)
+    return True
+
+
 def ensure_model_switch_idle(state):
+    _clear_idle_job(state)
     _clear_interrupted_turn(state)
     if not state.get("busy"):
         _clear_finished_agents(state)
@@ -380,11 +414,23 @@ def choose_session(api, identifier=None):
     ])
 
 
-def oauth_access(api, profile):
-    directory, _ = api.account_directory(profile)
-    directory = directory if directory is not None else api.ROOT
+def oauth_store(api, profile):
+    return api.read_json(api.claude_store(profile) / ".credentials.json").get("claudeAiOauth", {})
+
+
+def oauth_scopes(api, profile):
+    # Claude treats an env-var token as user:inference only, which turns off
+    # scope-gated features such as Claude in Chrome. Declare the login's real scopes.
     try:
-        data = api.read_json(directory / ".credentials.json").get("claudeAiOauth", {})
+        scopes = oauth_store(api, profile).get("scopes")
+    except (OSError, ValueError):
+        return ""
+    return " ".join(s for s in scopes if isinstance(s, str)) if isinstance(scopes, list) else ""
+
+
+def oauth_access(api, profile):
+    try:
+        data = oauth_store(api, profile)
         token, expires = data.get("accessToken"), data.get("expiresAt")
         if not isinstance(token, str) or not token or not isinstance(expires, (int, float)):
             raise ValueError("Falta una sesión OAuth válida")
@@ -398,7 +444,9 @@ def oauth_access(api, profile):
 def credentials(api, profile, target):
     result = api.provider_transport(target)
     if api.provider(target) == "Claude sub":
-        result.setdefault("env", {})["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_access(api, profile)
+        env = result.setdefault("env", {})
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_access(api, profile)
+        env["CLAUDE_CODE_OAUTH_SCOPES"] = oauth_scopes(api, profile)
     return result
 
 
@@ -517,6 +565,7 @@ def refresh_access(api, directory):
         if changed:
             state["revision"] += 1
             settings["env"]["CLAUDE_CODE_OAUTH_TOKEN"] = token
+            settings["env"]["CLAUDE_CODE_OAUTH_SCOPES"] = oauth_scopes(api, api.profile_path(state["profile"]))
             settings["env"]["CSW_HOT_REVISION"] = str(state["revision"])
             api.write_json(directory / "settings.json", settings)
         if state.get("auth_error") or changed:

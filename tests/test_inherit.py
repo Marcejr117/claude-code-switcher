@@ -13,6 +13,20 @@ shared = csw.shared_module()
 
 
 class InheritanceTest(unittest.TestCase):
+    def setUp(self):
+        # The hook reads the live provider; never the developer's real settings.json.
+        temp = tempfile.TemporaryDirectory(prefix="csw-test-")
+        self.addCleanup(temp.cleanup)
+        live, self.old_live = Path(temp.name) / "settings.json", csw.LIVE
+        csw.LIVE = live
+        self.addCleanup(setattr, csw, "LIVE", self.old_live)
+        csw.write_json(live, {"env": {"ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic"}})
+
+    def test_native_claude_agents_keep_their_own_model_and_effort(self):
+        csw.write_json(csw.LIVE, {"env": {}})
+        self.assertEqual(shared.inherit_tool(csw, {"tool_name": "Agent", "tool_input": {
+            "prompt": "fixture", "model": "haiku", "effort": "low"}}), {})
+
     def test_install_is_idempotent_and_keeps_permission_flow(self):
         settings = {"env": {}, "hooks": {}}
         shared.install(csw, settings)

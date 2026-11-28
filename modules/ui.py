@@ -4,45 +4,26 @@ import subprocess
 
 QUICK_HELP = """csw — tus cuentas y modelos en Claude Code
 
-EMPIEZA AQUÍ
-  csw                  Elegir proveedor y cuenta; modifica settings.json, no abre Claude
-  csw help --all       Todos los comandos, con ejemplos
+LO DE CADA DÍA
+  csw                  Menú guiado
+  csw list             Tus cuentas, numeradas; > marca la seleccionada
+  csw 2                Cambiar a la cuenta 2 (vale también su nombre: csw codex)
+  /model               Dentro de Claude: elegir modelo de la cuenta seleccionada
 
-CAMBIAR SIN REINICIAR CLAUDE
-  1. Deja Claude abierto. En OTRA terminal ejecuta csw.
-  2. Opción 1 → proveedor → cuenta → confirmar.
-  3. Espera un par de segundos. En el mismo Claude abre /model.
-  4. Elige un modelo de esa cuenta y continúa con tu conversación.
-  csw no abre ni reinicia Claude. Si aún no está abierto, ábrelo tú con claude.
+CUENTAS
+  csw add claude|codex|glm|deepseek|orcarouter|cursor <nombre>
+                       Crear una cuenta; el login o la clave se piden una sola vez
+  csw rename <cuenta> <nombre>    Cambiarle el nombre
+  csw remove <cuenta>             Retirarla (queda copia recuperable)
+  csw doctor                      Qué le falta a cada cuenta y cómo arreglarlo
 
-ATAJOS
-  csw codex            Seleccionar Codex en settings.json, sin abrir Claude
-  csw glm2             Seleccionar la cuenta GLM 2
-  csw claude:trabajo   Seleccionar otra cuenta Claude ya registrada
-  csw model cursor     Buscar y guardar el modelo para futuros arranques
-  csw list             Ver tus cuentas; > marca la seleccionada en settings.json
-
-¿QUÉ ES UN PERFIL?
-  Una cuenta guardada: codex, glm2 o claude:trabajo.
-  "csw model" guarda el modelo predeterminado; "/model" cambia la sesión abierta.
-  Los subagentes y workflows nuevos heredan el /model y /effort de esa sesión.
-  Los agentes en marcha conservan modelo/esfuerzo; sus llamadas posteriores pueden
-  usar la nueva cuenta cuando Claude haya recargado la configuración global.
-  El número de "csw 2" corresponde a "csw list", no al menú principal.
-
-IMPORTANTE
-  Afecta a TODOS los Claude que leen este settings.json. Sus siguientes
-  peticiones enviarán el historial a la nueva cuenta/proveedor.
-  /model permite cambiar de modelo con un goal activo, entre turnos y sin agentes
-  trabajando. El cambio global de cuenta se publica incluso durante turnos o goals:
-  lo ya enviado acaba en la cuenta anterior y las llamadas nuevas usan la elegida.
-  Sesiones antiguas con csw run/--settings no recargan la conexión: quedaron
-  fijadas al arrancar. No pueden liberarse editando settings.json.
-  Si tu terminal conserva el lanzador anterior: source ~/.local/share/csw/shell.sh
-  Esto actualiza el comando claude del shell, no un proceso Claude ya iniciado.
-  csw hot help explica el modo aislado opcional; no es necesario para este flujo.
-  Cursor: texto comprobado; herramientas, agentes y MCP no garantizados.
-  El contexto depende del modelo: [1m] no amplía el límite del proveedor.
+A TENER EN CUENTA
+  El cambio vale para todos los Claude abiertos: lo recargan solos en segundos.
+  Para abrir una sesión con otra cuenta sin tocar las demás: csw run <cuenta>.
+  Cambiar entre cuentas de Claude no pide login otra vez; Chrome, la extensión
+  del editor y los conectores siguen funcionando.
+  Con otros proveedores el navegador va como servidor MCP «chrome».
+  Todos los comandos: csw help --all
 """
 
 FULL_HELP = """csw — referencia completa
@@ -101,6 +82,7 @@ CUENTAS — perfil = proveedor o proveedor:nombre
                                   Nueva cuenta; nombre corto, como trabajo o marce3
   csw login <perfil>               Renovar; Codex muestra URL corta + código
   csw login <perfil> --browser     Usar navegador en Codex; Claude/Cursor ya lo usan
+  csw rename <perfil> <nombre>     Renombrar la cuenta (Claude, GLM, DeepSeek, OrcaRouter)
   csw name <perfil> <etiqueta>     Cambiar el nombre visible, no el login
                                   En Codex principal, un nombre corto añade codex:nombre
                                   como identificador; csw codex sigue funcionando
